@@ -1,0 +1,17 @@
+[package]
+name = "sshcrab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sshcrab-proto.workspace = true
+tokio.workspace = true
+clap.workspace = true
+cliclack.workspace = true
+nix.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+libc.workspace = true

@@ -1,0 +1,26 @@
+[package]
+name = "sshcrab-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sctp-proto.workspace = true
+snow.workspace = true
+ed25519-dalek.workspace = true
+ssh-key.workspace = true
+ruzstd.workspace = true
+postcard.workspace = true
+serde.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+sha2.workspace = true
+getrandom.workspace = true
+bytes.workspace = true
+log.workspace = true
+thiserror.workspace = true
+socket2.workspace = true
+
+[dev-dependencies]
+env_logger.workspace = true

@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = ["proto", "client", "server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[workspace.dependencies]
+sshcrab-proto = { path = "proto" }
+sctp-proto = "0.10"
+snow = { version = "0.10", default-features = false, features = ["default-resolver", "std", "use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom"] }
+ed25519-dalek = { version = "2", features = ["zeroize"] }
+ssh-key = { version = "0.6", default-features = false, features = ["std", "ed25519", "alloc"] }
+ruzstd = "0.9"
+postcard = { version = "1", features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+nix = { version = "0.31", features = ["user", "process", "signal", "term", "fs", "ioctl", "pthread", "resource", "hostname"] }
+clap = { version = "4", features = ["derive"] }
+cliclack = "0.5"
+uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = "1"
+toml = "1"
+sha2 = "0.10"
+getrandom = "0.3"
+bytes = "1"
+log = "0.4"
+env_logger = "0.11"
+thiserror = "2"
+anyhow = "1"
+socket2 = "0.6"
+libc = "0.2"
+
+[profile.release]
+panic = "unwind"
