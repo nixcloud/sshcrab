@@ -2,7 +2,9 @@
 # End-to-end test of the P2P backend on 127.0.0.1 (spec §13, P4): a local
 # sshcrab-dht-node as the only bootstrap node, sshcrabd with P2P = true, the
 # sshcrabd-p2p helper (unsandboxed, as the same user) and the client
-# connecting to the .p2p address. Needs target/debug binaries.
+# connecting to the .p2p address. One machine plays three hosts: DHT nodes on
+# 127.0.0.1, the helper on 127.0.0.2, the client on 127.0.0.3, peeroxide's
+# same-network shortcut off, so the hole-punch path runs. Needs target/debug binaries.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 B=$ROOT/target/debug
@@ -33,10 +35,17 @@ chmod 644 "$T/srv/sshcrabd.toml"
 "$B/sshcrab-dht-node" --host 127.0.0.1 --port $DHT > "$T/dht.log" 2>&1 &
 PIDS+=($!)
 sleep 0.5
+# NAT classification needs replies from at least three nodes.
+for p in 1 2 3; do
+    "$B/sshcrab-dht-node" --host 127.0.0.1 --port $((DHT + 1 + p)) --bootstrap 127.0.0.1:$DHT >> "$T/dht.log" 2>&1 &
+    PIDS+=($!)
+done
+PIDS+=($!)
+sleep 0.5
 (cd "$T/srv" && exec env SSHCRABD_HOME="$T/home" SSHCRABD_SHELL="$(command -v bash)" "$B/sshcrabd" -p $PORT) > "$T/daemon.log" 2>&1 &
 PIDS+=($!)
 sleep 1
-"$B/sshcrabd-p2p" --socket "$T/run/p2p.sock" > "$T/helper.log" 2>&1 &
+RUST_LOG=info,peeroxide::swarm=debug SSHCRAB_P2P_BIND=127.0.0.2 SSHCRAB_P2P_NO_LOCAL=1 "$B/sshcrabd-p2p" --socket "$T/run/p2p.sock" > "$T/helper.log" 2>&1 &
 HELPER=$!
 PIDS+=($HELPER)
 for _ in $(seq 1 30); do grep -q 'announced as' "$T/helper.log" && break; sleep 0.5; done
@@ -46,7 +55,7 @@ check "sshcrabd logs its P2P address" "[ -n '$ADDR' ]"
 check "the helper announces that address" "grep -q 'announced as $ADDR' '$T/helper.log'"
 check "the control socket is mode 0660" "[ \$(stat -c %a '$T/run/p2p.sock') = 660 ]"
 
-c() { timeout 90 "$B/sshcrab" --bootstrap 127.0.0.1:$DHT "$@"; }
+c() { SSHCRAB_P2P_BIND=127.0.0.3 SSHCRAB_P2P_NO_LOCAL=1 timeout 90 "$B/sshcrab" --bootstrap 127.0.0.1:$DHT "$@"; }
 c "$ADDR" true </dev/null 2>"$T/err"
 check "unknown host key on a .p2p address is refused without --accept-new" "grep -q 'unknown host key for $ADDR' '$T/err'"
 c --accept-new "$ADDR" true </dev/null 2>/dev/null
@@ -69,12 +78,14 @@ check "interactive session over P2P runs on a PTY" "grep -q /dev/pts/ <<<\"\$out
 # The helper restarts (as systemd would) and the address stays the same.
 kill $HELPER; wait $HELPER 2>/dev/null
 check "sshcrabd notices the helper leaving" "sleep 0.5; grep -q 'P2P helper disconnected' '$T/daemon.log'"
-"$B/sshcrabd-p2p" --socket "$T/run/p2p.sock" > "$T/helper2.log" 2>&1 &
+SSHCRAB_P2P_BIND=127.0.0.2 SSHCRAB_P2P_NO_LOCAL=1 "$B/sshcrabd-p2p" --socket "$T/run/p2p.sock" > "$T/helper2.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 1 30); do grep -q 'announced as' "$T/helper2.log" && break; sleep 0.5; done
 check "a restarted helper announces the same address" "grep -q 'announced as $ADDR' '$T/helper2.log'"
 out=$(c "$ADDR" 'echo again' </dev/null 2>/dev/null)
 check "connections work after a helper restart" "[ '$out' = again ]"
+
+check "connections took the hole-punch path (not a same-host shortcut)" "grep -q 'passive holepunch landed' '$T/helper.log'"
 
 # A wrong key at a known address is a mismatch, as for UDP hosts.
 sed -i "s|^$ADDR 0 ssh-ed25519 .*|$ADDR 0 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDgP2oyNSbMWDPXH8G8dXFR4qiCaUvwyEDyrVMxRGrD3|" "$T/client/.sshcrab/hostkeys"

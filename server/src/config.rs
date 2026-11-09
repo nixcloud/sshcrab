@@ -35,6 +35,8 @@ pub struct Config {
     /// client addresses are unknown).
     #[serde(rename = "MaxUnauthP2P")]
     pub max_unauth_p2p: usize,
+    /// Root-managed `<dir>/<user>` key files, checked before ~/.sshcrab/authorized_keys.
+    pub authorized_keys_dir: String,
 }
 
 impl Default for Config {
@@ -54,6 +56,7 @@ impl Default for Config {
             p2p_user: "sshcrab-p2p".into(),
             p2p_bootstrap: vec![],
             max_unauth_p2p: 16,
+            authorized_keys_dir: String::new(),
         }
     }
 }

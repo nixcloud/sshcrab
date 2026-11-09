@@ -19,6 +19,8 @@ log.workspace = true
 env_logger.workspace = true
 thiserror.workspace = true
 postcard.workspace = true
+# peeroxide logs with tracing; forward it to env_logger (RUST_LOG).
+tracing = { version = "0.1", features = ["log"] }
 
 [dev-dependencies]
 env_logger.workspace = true

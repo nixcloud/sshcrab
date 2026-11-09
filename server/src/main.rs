@@ -29,11 +29,17 @@ struct Args {
     /// UDP port for every listen address.
     #[arg(short = 'p', long)]
     port: Option<u16>,
+    /// Print this host's P2P address (from host_key in the working directory) and exit.
+    #[arg(long)]
+    p2p_address: bool,
 }
 
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
+    if args.p2p_address {
+        return print_p2p_address();
+    }
     match tokio::runtime::Runtime::new().expect("tokio runtime").block_on(run(args)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -54,6 +60,26 @@ fn check_owner(path: &Path, what: &str) -> Result<(), String> {
         return Err(format!("{what} {} is group- or world-writable (mode {:04o})", path.display(), meta.mode() & 0o7777));
     }
     Ok(())
+}
+
+/// `--p2p-address`: never generates a key, so it is safe to run any time.
+fn print_p2p_address() -> ExitCode {
+    let path = Path::new("host_key");
+    if path.symlink_metadata().is_err() {
+        eprintln!("sshcrabd: no host_key in this directory yet; start sshcrabd once to generate it");
+        return ExitCode::FAILURE;
+    }
+    match Identity::load(path) {
+        Ok(id) => {
+            let key = sshcrab_proto::p2p::public_key(&id.p2p_seed());
+            println!("{}", sshcrab_proto::p2p::format_address(&key));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("sshcrabd: cannot load host key: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn host_key() -> Result<Identity, String> {

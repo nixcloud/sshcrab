@@ -69,7 +69,7 @@ pub fn authorize(cfg: &Config, username: &str, key: &[u8; 32]) -> Result<Account
     if account_expired(username) {
         return deny("account expired");
     }
-    if !key_authorized(&user, key) {
+    if !key_authorized(cfg, &user, key) {
         return deny("key not in authorized_keys");
     }
     // Only now, after the key matched, may the client learn the nologin text.
@@ -119,7 +119,28 @@ fn strict_ok(path: &Path, uid: u32, allow_symlink: bool) -> bool {
     ok
 }
 
-fn key_authorized(user: &User, key: &[u8; 32]) -> bool {
+fn key_authorized(cfg: &Config, user: &User, key: &[u8; 32]) -> bool {
+    let matches = |contents: &str| {
+        contents
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .filter_map(keys::parse_public_openssh)
+            .any(|k| &k == key)
+    };
+    // Root-managed keys first (`AuthorizedKeysDir`, e.g. from the NixOS module):
+    // the directory and the file must belong to root.
+    if !cfg.authorized_keys_dir.is_empty() && !user.name.starts_with('.') {
+        let dir = Path::new(&cfg.authorized_keys_dir);
+        let file = dir.join(&user.name);
+        if file.exists() && strict_ok(dir, 0, true) && strict_ok(&file, 0, true) {
+            if let Some(contents) = read_limited(&file) {
+                if matches(&contents) {
+                    return true;
+                }
+            }
+        }
+    }
     let uid = user.uid.as_raw();
     let dir = user.dir.join(".sshcrab");
     let file = dir.join("authorized_keys");
@@ -127,12 +148,13 @@ fn key_authorized(user: &User, key: &[u8; 32]) -> bool {
         return false;
     }
     let Some(contents) = read_as_user(&file, uid) else { return false };
-    contents
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter_map(keys::parse_public_openssh)
-        .any(|k| &k == key)
+    matches(&contents)
+}
+
+fn read_limited(path: &Path) -> Option<String> {
+    let mut s = String::new();
+    std::fs::File::open(path).ok()?.take(256 * 1024).read_to_string(&mut s).ok()?;
+    Some(s)
 }
 
 /// Read with the user's filesystem uid so root privileges cannot be abused

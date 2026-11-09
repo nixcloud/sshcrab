@@ -3,9 +3,17 @@ self:
 let
   cfg = config.services.sshcrab;
   pkgsFor = self.packages.${pkgs.stdenv.hostPlatform.system};
+  sandbox = import ./nix/sandbox.nix;
+  keysDir = "/etc/sshcrab/authorized_keys.d";
+
   settingsFormat = pkgs.formats.toml { };
   configFile = settingsFormat.generate "sshcrabd.toml" ({
     ListenAddress = cfg.listenAddresses;
+    PermitRootLogin = cfg.permitRootLogin;
+    AllowUsers = cfg.allowUsers;
+    AllowGroups = cfg.allowGroups;
+  } // lib.optionalAttrs (cfg.authorizedKeys != { }) {
+    AuthorizedKeysDir = keysDir;
   } // lib.optionalAttrs cfg.p2p.enable ({
     P2P = true;
     P2PSocket = "/run/sshcrab/p2p.sock";
@@ -14,42 +22,11 @@ let
     P2PBootstrap = cfg.p2p.bootstrap;
   }) // cfg.settings);
 
-  # Shared by the P2P helper and the DHT node: unprivileged network services
-  # that parse untrusted input (SPECIFICATION.md §13.5).
-  sandbox = {
-    NoNewPrivileges = true;
-    CapabilityBoundingSet = "";
-    AmbientCapabilities = "";
-    ProtectSystem = "strict";
-    ProtectHome = true;
-    PrivateTmp = true;
-    PrivateDevices = true;
-    ProtectProc = "invisible";
-    ProcSubset = "pid";
-    ProtectKernelTunables = true;
-    ProtectKernelModules = true;
-    ProtectKernelLogs = true;
-    ProtectControlGroups = true;
-    ProtectClock = true;
-    ProtectHostname = true;
-    RestrictNamespaces = true;
-    RestrictRealtime = true;
-    RestrictSUIDSGID = true;
-    LockPersonality = true;
-    MemoryDenyWriteExecute = true;
-    RemoveIPC = true;
-    UMask = "0077";
-    # Netlink: the DHT lists local interface addresses.
-    RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" "AF_NETLINK" ];
-    SystemCallFilter = [ "@system-service" "~@privileged" ];
-    SystemCallArchitectures = "native";
-    # Its own cgroup: the unbounded queues of the young DHT stack cannot
-    # take sshcrabd or the user sessions down with them.
-    MemoryMax = "256M";
-    TasksMax = 64;
-    Restart = "on-failure";
-    RestartSec = 2;
-  };
+  # `sshcrab-p2p-address`: the address only exists once sshcrabd generated
+  # its host key, so it cannot be known at evaluation time.
+  addressTool = pkgs.writeShellScriptBin "sshcrab-p2p-address" ''
+    cd /var/lib/sshcrab && exec ${cfg.package}/bin/sshcrabd --p2p-address
+  '';
 in
 {
   options.services.sshcrab = {
@@ -62,10 +39,17 @@ in
       description = "Package providing bin/sshcrabd.";
     };
 
+    clientPackage = lib.mkOption {
+      type = lib.types.nullOr lib.types.package;
+      default = pkgsFor.sshcrab;
+      defaultText = lib.literalExpression "sshcrab.packages.\${system}.sshcrab";
+      description = "Client tools (sshcrab, sshcrab-keygen-ed25519) to install system-wide; null = none.";
+    };
+
     port = lib.mkOption {
       type = lib.types.port;
       default = 22;
-      description = "UDP port for every listen address (passed as -p).";
+      description = "UDP port for every listen address (passed as -p). sshcrab uses UDP, so it does not clash with OpenSSH.";
     };
 
     listenAddresses = lib.mkOption {
@@ -77,21 +61,58 @@ in
     openFirewall = lib.mkOption {
       type = lib.types.bool;
       default = false;
-      description = "Open `port` for UDP in the firewall.";
+      description = "Open `port` for UDP. Not needed for P2P-only access.";
+    };
+
+    permitRootLogin = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Allow logging in as root (always key-only).";
+    };
+
+    allowUsers = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = "Only these users may log in; empty = everyone with a valid account and key.";
+    };
+
+    allowGroups = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "wheel" ];
+      description = "Only members of these groups may log in; empty = no restriction.";
+    };
+
+    authorizedKeys = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.listOf lib.types.str);
+      default = { };
+      example = { alice = [ "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... alice@laptop" ]; };
+      description = ''
+        Public keys per user, as written by sshcrab-keygen-ed25519. Installed
+        root-owned in ${keysDir}/<user> and accepted in addition to the
+        user's own ~/.sshcrab/authorized_keys.
+      '';
+    };
+
+    logLevel = lib.mkOption {
+      type = lib.types.str;
+      default = "info";
+      example = "debug";
+      description = "RUST_LOG for sshcrabd and sshcrabd-p2p.";
     };
 
     settings = lib.mkOption {
       type = settingsFormat.type;
       default = { };
-      example = { MaxSessionsPerUser = 16; AllowGroups = [ "wheel" ]; };
-      description = "Further sshcrabd.toml settings (see SPECIFICATION.md §3).";
+      example = { MaxSessionsPerUser = 16; DisconnectedTimeout = "12h"; };
+      description = "Further sshcrabd.toml settings (SPECIFICATION.md §3); they override the options above.";
     };
 
     p2p = {
       enable = lib.mkEnableOption ''
-        reachability through the DHT, for hosts behind NAT: runs the
-        sandboxed sshcrabd-p2p helper. sshcrabd logs the host's P2P address
-        (`<key>.p2p`) at startup'';
+        reachability through the DHT, for hosts behind NAT or without open
+        ports: runs the sandboxed sshcrabd-p2p helper. Run
+        `sshcrab-p2p-address` for the host's address (`<key>.p2p`)'';
 
       package = lib.mkOption {
         type = lib.types.package;
@@ -124,6 +145,12 @@ in
         description = "Package providing bin/sshcrab-dht-node.";
       };
 
+      host = lib.mkOption {
+        type = lib.types.str;
+        default = "0.0.0.0";
+        description = "Address to bind. 0.0.0.0 works when the node joins others (`public` or `bootstrap`), from which it learns its address; otherwise set its public IPv4.";
+      };
+
       port = lib.mkOption {
         type = lib.types.port;
         default = 49737;
@@ -145,19 +172,40 @@ in
       openFirewall = lib.mkOption {
         type = lib.types.bool;
         default = true;
-        description = "Open `port` for UDP in the firewall.";
+        description = "Open `port` for UDP.";
       };
     };
   };
 
   config = lib.mkMerge [
+    {
+      assertions = [{
+        assertion = cfg.dhtNode.enable -> (cfg.dhtNode.public || cfg.dhtNode.bootstrap != [ ] || cfg.dhtNode.host != "0.0.0.0");
+        message = "services.sshcrab.dhtNode: a node that joins no other nodes (public = false, no bootstrap) must bind its public IPv4 address (dhtNode.host); its DHT id derives from it";
+      } {
+        assertion = cfg.p2p.enable -> cfg.enable;
+        message = "services.sshcrab.p2p.enable needs services.sshcrab.enable";
+      }];
+    }
+
     (lib.mkIf cfg.enable {
       networking.firewall.allowedUDPPorts = lib.mkIf cfg.openFirewall [ cfg.port ];
+      environment.systemPackages = lib.optional (cfg.clientPackage != null) cfg.clientPackage
+        ++ lib.optional cfg.p2p.enable addressTool;
+
+      # Copies (mode), not symlinks into the store: root-owned, read-only.
+      environment.etc = lib.mapAttrs' (user: keys:
+        lib.nameValuePair "sshcrab/authorized_keys.d/${user}" {
+          text = lib.concatStringsSep "\n" keys + "\n";
+          mode = "0444";
+        }) cfg.authorizedKeys;
 
       systemd.services.sshcrabd = {
         description = "sshcrab remote shell daemon";
         wantedBy = [ "multi-user.target" ];
         after = [ "network.target" ];
+        restartTriggers = [ configFile ];
+        environment.RUST_LOG = cfg.logLevel;
         serviceConfig = {
           # workdir with host_key (generated on first start) and sshcrabd.toml
           StateDirectory = "sshcrab";
@@ -193,6 +241,7 @@ in
         bindsTo = [ "sshcrabd.service" ];
         after = [ "sshcrabd.service" "network-online.target" ];
         wants = [ "network-online.target" ];
+        environment.RUST_LOG = cfg.logLevel;
         serviceConfig = sandbox // {
           ExecStart = "${cfg.p2p.package}/bin/sshcrabd-p2p --socket /run/sshcrab/p2p.sock --max-peers ${toString cfg.p2p.maxPeers}";
           User = "sshcrab-p2p";
@@ -212,10 +261,11 @@ in
         wantedBy = [ "multi-user.target" ];
         after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
+        environment.RUST_LOG = cfg.logLevel;
         serviceConfig = sandbox // {
           ExecStart = lib.escapeShellArgs ([
             "${cfg.dhtNode.package}/bin/sshcrab-dht-node"
-            "--host" "0.0.0.0"
+            "--host" cfg.dhtNode.host
             "--port" (toString cfg.dhtNode.port)
           ] ++ lib.optional cfg.dhtNode.public "--public"
             ++ lib.concatMap (b: [ "--bootstrap" b ]) cfg.dhtNode.bootstrap);

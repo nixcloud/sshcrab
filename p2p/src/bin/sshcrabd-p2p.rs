@@ -69,9 +69,25 @@ async fn run(args: Args) -> Result<(), String> {
     if hello.version != CONTROL_VERSION {
         return Err(format!("control protocol {} from sshcrabd, expected {CONTROL_VERSION}", hello.version));
     }
-    let mut server = sshcrab_p2p::announce(&hello.seed, &hello.bootstrap, args.max_peers)
-        .await
-        .map_err(|e| format!("announcing: {e}"))?;
+    // The network or the bootstrap nodes may not be up yet (boot, outage).
+    let mut warned = false;
+    let mut server = loop {
+        match sshcrab_p2p::announce(&hello.seed, &hello.bootstrap, args.max_peers).await {
+            Ok(s) => break s,
+            Err(e) => {
+                if !warned {
+                    log::warn!("announcing: {e}; retrying every 5 s");
+                    warned = true;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    r = ctl.recv(&mut buf) => if matches!(r, Ok((0, _)) | Err(_)) {
+                        return Err("sshcrabd went away".into());
+                    },
+                }
+            }
+        }
+    };
     drop(hello);
     log::info!("announced as {}", format_address(&server.public_key));
 

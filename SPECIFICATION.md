@@ -537,7 +537,7 @@ snow), `sha2`, `subtle`, `zeroize`, `postcard`, `serde`, `ruzstd`, `nix`, `clap`
 | M7 daemon ops | mostly — config, `-p`, host key checks, NixOS module; module not yet tested in a VM |
 | M8 tests | partial — 18 unit tests + `tests/e2e.sh` (16 checks incl. a 20 s outage); NixOS VM test missing |
 | M9 privilege separation | not started — release blocker |
-| P2P backend (§13) | implemented and tested on loopback; real-NAT test, VM test, relay, IPv6 open (§13.8) |
+| P2P backend (§13) | implemented; hole punching works between distinct addresses on one host (16/16 e2e); real NAT not yet verified (§13.8) |
 
 Known gaps: never run as root yet (setuid path, PTY chown, `/proc/self/loginuid`, `setfsuid`); output throughput
 is ~2.5 MB/s on loopback in a debug build (one ack per 16 KiB chunk, compression of incompressible data); no
@@ -610,7 +610,9 @@ sshcrab ──DHT lookup + hole punch──► sshcrabd-p2p (sandboxed, user ssh
   `--bootstrap HOST:PORT` (repeatable). peeroxide resolves host names itself.
 - `sshcrab-dht-node [--host 0.0.0.0] [--port 49737] [--public] [--bootstrap …]`: a non-ephemeral, non-firewalled node;
   `services.sshcrab.dhtNode.enable` (+ `port`, `public` = true, `bootstrap`, `openFirewall` = true) runs it sandboxed
-  as a `DynamicUser`. bootstrap.nixcloud.io: a small VPS with a static public IPv4 and UDP 49737 open. The blind relay
+  as a `DynamicUser`. A node bound to a wildcard address learns its DHT id (derived from its public address) from
+  the nodes it joins; a first node without any must bind its public IPv4 (enforced by the binary and the module).
+  bootstrap.nixcloud.io: a small VPS with a static public IPv4 and UDP 49737 open. The blind relay
   stays off (bandwidth, abuse).
 
 ### 13.7 Deviations from P2P.md
@@ -625,12 +627,33 @@ sshcrab ──DHT lookup + hole punch──► sshcrabd-p2p (sandboxed, user ssh
   `sshcrab-p2p` crate (client connector, `sshcrabd-p2p`, `sshcrab-dht-node`), sshcrabd control socket, client
   `.p2p` hosts with `--bootstrap` and `config.toml`, NixOS options, flake package `sshcrab-p2p`.
 - Tests: `p2p/tests/local_dht.rs` (bootstrap node, announce, connect, relay, handshake on 127.0.0.1),
-  `tests/e2e-p2p.sh` (15 checks: address, TOFU, commands, 2 MB both ways, PTY, helper restart, mismatch,
+  `tests/e2e-p2p.sh` (16 checks, three simulated hosts: address, TOFU, commands, 2 MB both ways, PTY, hole-punch path, helper restart, mismatch,
   sshcrabd not linking peeroxide), handshake over a bridged pipe, address and fd-passing unit tests.
-- Not yet: hole punching across real NATs (only loopback tested — the P0 measurement across two NATs is still
-  owed), a NixOS VM test with NAT routers and the sandboxed units (the systemd sandbox is untested), root mode with
-  the real `sshcrab-p2p` user, the relay for symmetric NATs, IPv6, a fuzz target for the frame decoder, upstream report
-  of peeroxide's unbounded queues, deploying bootstrap.nixcloud.io (the name does not resolve yet; clients fall back
-  to the public nodes).
+- NixOS VM tests (`nix/test-p2p.nix`, KVM through the Nix daemon): `checks.p2p` runs the sandboxed module stack
+  (root sshcrabd, `sshcrab-p2p` user, `AuthorizedKeysDir`, announce retry, data both ways, helper restart) between
+  hosts without firewalls. `checks.p2p-nat` puts the server behind a NAT router.
+- **Hole punching: works in the host tests, not yet verified across real NATs.** Findings:
+  1. Signalling works through the NAT: the client finds the record, and PEER_HANDSHAKE is relayed via a DHT node in
+     both directions.
+  2. A server announcing before any DHT node is reachable "succeeds" and is only retried after 10 minutes; fixed:
+     `announce` fails on an empty routing table and the helper retries every 5 s.
+  3. A DHT node bound to `0.0.0.0` without others to join gets no valid node id (it derives from its public
+     address); fixed: refused by `sshcrab-dht-node` and asserted in the module (§13.6).
+  4. NAT classification needs replies from at least three DHT nodes; with fewer the server reports `UNKNOWN` and
+     never offers hole punching (on the internet there are enough nodes).
+  5. In the VMs both sides then run peeroxide's hole punch and time out; also without NAT and without firewalls.
+     The VMs had a second interface with the same address (10.0.2.15) on every host, which peeroxide advertises
+     and probes; removing it did not fix the VM test either. **Cause not found; most likely the VM environment
+     or our configuration there, not peeroxide** — see 6.
+  6. **Host test (`p2p/tests/cross_host.rs`, `tests/e2e-p2p.sh`): it works.** One machine plays three hosts
+     (DHT nodes on 127.0.0.1, server on 127.0.0.2, client on 127.0.0.3, peeroxide's same-network shortcut off via
+     `SSHCRAB_P2P_BIND`/`SSHCRAB_P2P_NO_LOCAL`). Signalling, NAT classification, hole punch ("passive holepunch
+     landed") and the full sshcrab session pass: 16/16 e2e checks, the punch path is asserted. An earlier
+     conclusion that peeroxide's server side is broken between hosts was wrong.
+  Open: real NATs and firewalls are only covered by the VM tests, which still fail; the test environment comes first
+  (SPECIFICATION.md §11, test plan).
+- Not yet: the relay for symmetric NATs, IPv6, a fuzz target for the frame decoder, upstream report of peeroxide's
+  unbounded queues, deploying bootstrap.nixcloud.io (the name does not resolve yet; clients fall back to the public
+  nodes).
 - A client that refuses the host key exits before its bridge has closed the peeroxide stream; sshcrabd notices only
   at the 10 s handshake timeout (one pre-auth slot meanwhile), as with any client that vanishes.

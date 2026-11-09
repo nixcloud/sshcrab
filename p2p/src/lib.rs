@@ -27,6 +27,8 @@ pub enum P2pError {
     Swarm(#[from] peeroxide::SwarmError),
     #[error("the peer presented a different key")]
     WrongPeer,
+    #[error("no DHT node reachable (bootstrap: {0})")]
+    NoNodes(String),
 }
 
 /// DHT settings for `bootstrap` (`host:port` or `ip@host:port`).
@@ -77,8 +79,16 @@ pub async fn announce(seed: &[u8; 32], bootstrap: &[String], max_peers: usize) -
     let mut cfg = peeroxide::SwarmConfig::default();
     cfg.key_pair = Some(key_pair);
     cfg.dht = dht_config(bootstrap);
+    apply_test_env(&mut cfg);
     cfg.max_peers = max_peers;
     let (task, handle, connections) = peeroxide::spawn(cfg).await?;
+    // Announcing into an empty routing table "succeeds" and is only retried
+    // after 10 minutes; fail instead, so the caller retries soon.
+    if handle.dht().table_size().await.unwrap_or(0) == 0 {
+        let _ = handle.destroy().await;
+        task.abort();
+        return Err(P2pError::NoNodes(bootstrap.join(", ")));
+    }
     let mut opts = peeroxide::JoinOpts::default();
     opts.server = true;
     opts.client = false;
@@ -93,36 +103,53 @@ pub async fn announce(seed: &[u8; 32], bootstrap: &[String], max_peers: usize) -
 /// returned [`Conn`] carries our protocol; a throwaway DHT node and key pair
 /// live as long as it does, so nothing about the user ends up in the DHT.
 pub async fn connect(bootstrap: &[String], remote: [u8; 32]) -> Result<Conn, P2pError> {
-    let runtime = UdxRuntime::new()?;
-    let (task, dht, _server_rx) = hyperdht::spawn(&runtime, dht_config(bootstrap)).await?;
+    // Through the swarm, like the server: its socket handling (which socket a
+    // firewalled node is reachable on, hole punching) is the tested path. The
+    // lower-level `HyperDhtHandle::connect` failed between separate hosts.
+    let mut cfg = peeroxide::SwarmConfig::default();
+    cfg.key_pair = Some(KeyPair::generate());
+    cfg.dht = dht_config(bootstrap);
+    apply_test_env(&mut cfg);
+    cfg.max_peers = 4;
+    let (task, handle, mut connections) = peeroxide::spawn(cfg).await?;
+    let topic = peeroxide::discovery_key(&remote);
     let result = async {
-        dht.bootstrapped().await?;
-        let key_pair = KeyPair::generate();
-        let peer = dht.connect(&key_pair, remote, &runtime).await?;
-        // Noise IK already guarantees this; checked anyway, it is the whole point.
-        if peer.remote_public_key != remote {
-            return Err(P2pError::WrongPeer);
+        if handle.dht().table_size().await.unwrap_or(0) == 0 {
+            return Err(P2pError::NoNodes(bootstrap.join(", ")));
         }
-        Ok(peer)
+        let mut opts = peeroxide::JoinOpts::default();
+        opts.server = false;
+        opts.client = true;
+        handle.join(topic, opts).await?;
+        // Anyone may announce on the topic; only the holder of `remote` counts
+        // (Noise IK authenticated the key the swarm reports).
+        loop {
+            let c = connections.recv().await.ok_or(P2pError::WrongPeer)?;
+            if c.remote_public_key() == &remote {
+                return Ok(c);
+            }
+        }
     }
     .await;
     let peer = match result {
         Ok(p) => p,
         Err(e) => {
-            let _ = dht.destroy().await;
+            let _ = handle.destroy().await;
             task.abort();
             return Err(e);
         }
     };
-    let (conn, ends) = Conn::pipe(Remote::P2p(peer.remote_addr));
+    // One connection is all we want; no further dialling.
+    let _ = handle.leave(topic).await;
+    let (conn, ends) = Conn::pipe(Remote::P2p(peer.peer.remote_addr));
     tokio::spawn(async move {
         let peer = peer;
-        let stream = peer.stream;
+        let stream = peer.peer.stream;
         bridge_secret_stream(stream, ends).await;
-        // `peer.socket` and the rest of the connection stay alive until here.
-        let _ = dht.destroy().await;
+        // The rest of the connection (socket, swarm) stays alive until here.
+        drop(peer.peer.socket);
+        let _ = handle.destroy().await;
         task.abort();
-        drop(runtime);
     });
     Ok(conn)
 }
@@ -202,5 +229,18 @@ where
     tokio::select! {
         _ = up => {}
         _ = down => {}
+    }
+}
+
+/// Test and diagnostic knobs for the client and the helper (not for production):
+/// `SSHCRAB_P2P_BIND=<ipv4>` binds the DHT to one address, and
+/// `SSHCRAB_P2P_NO_LOCAL=1` turns off peeroxide's same-network shortcut. Together
+/// they let one machine play several hosts (127.0.0.2, 127.0.0.3, …).
+fn apply_test_env(cfg: &mut peeroxide::SwarmConfig) {
+    if let Ok(host) = std::env::var("SSHCRAB_P2P_BIND") {
+        cfg.dht.dht.host = host;
+    }
+    if std::env::var_os("SSHCRAB_P2P_NO_LOCAL").is_some() {
+        cfg.local_connection = false;
     }
 }

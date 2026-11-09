@@ -7,7 +7,8 @@ use sshcrab_proto::p2p::DHT_NODE_PORT;
 #[derive(Parser)]
 #[command(name = "sshcrab-dht-node", version, about = "DHT bootstrap node for sshcrab")]
 struct Args {
-    /// Address to bind.
+    /// Address to bind: the node's public IPv4 address; 0.0.0.0 only together
+    /// with --public or --bootstrap, from which it learns its address.
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
     /// UDP port (must be reachable from the internet).
@@ -30,6 +31,12 @@ fn main() -> std::process::ExitCode {
     }
     if args.public {
         args.bootstrap.extend(peeroxide::DEFAULT_BOOTSTRAP.iter().map(|s| s.to_string()));
+    }
+    // A node's DHT id derives from its public address. Bound to a wildcard it
+    // learns that address from other nodes; a first node without any never does.
+    if (args.host == "0.0.0.0" || args.host == "::") && args.bootstrap.is_empty() {
+        eprintln!("sshcrab-dht-node: with no other nodes to join (--public or --bootstrap), --host must be this node's public IPv4 address");
+        return std::process::ExitCode::from(2);
     }
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
