@@ -870,8 +870,6 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 [[package]]
 name = "libudx"
 version = "1.7.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19ad364afe8d2326f3cb1315c1c729fa62828ae88ba0cfa7bdc36f619d7244ca"
 dependencies = [
  "thiserror",
  "tokio",

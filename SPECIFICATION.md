@@ -650,6 +650,13 @@ sshcrab ──DHT lookup + hole punch──► sshcrabd-p2p (sandboxed, user ssh
      `SSHCRAB_P2P_BIND`/`SSHCRAB_P2P_NO_LOCAL`). Signalling, NAT classification, hole punch ("passive holepunch
      landed") and the full sshcrab session pass: 16/16 e2e checks, the punch path is asserted. An earlier
      conclusion that peeroxide's server side is broken between hosts was wrong.
+  7. **Latency (first real-internet test, 40 ms ping):** the shell answered after about 200 ms. Cause in libudx
+     1.7.4: `UdxAsyncStream` allowed one outstanding write and its `poll_flush` waited for the ACK, and
+     SecretStream writes every message as header + body + flush, so each message cost two round trips, one at a
+     time. Fixed in a vendored copy (`vendor/libudx`, `[patch.crates-io]`, see `vendor/libudx/SSHCRAB-PATCH.md`):
+     writes return once queued (backpressure above 1 MiB unacknowledged), flush no longer waits, shutdown waits
+     for all ACKs; small writes are appended to the newest unsent packet. `p2p/tests/latency.rs` (40 ms simulated
+     round trip): echo 132 ms → 45 ms, 50 messages there and back 4.4 s → 56 ms. To report upstream.
   Open: real NATs and firewalls are only covered by the VM tests, which still fail; the test environment comes first
   (SPECIFICATION.md §11, test plan).
 - Not yet: the relay for symmetric NATs, IPv6, a fuzz target for the frame decoder, upstream report of peeroxide's
