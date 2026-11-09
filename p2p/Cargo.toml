@@ -1,0 +1,24 @@
+[package]
+name = "sshcrab-p2p"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "P2P (HyperDHT) backend of sshcrab: client connector, sshcrabd-p2p helper, DHT node"
+
+[dependencies]
+sshcrab-proto.workspace = true
+# Pinned exactly: young, unaudited stack (SPECIFICATION.md §13).
+peeroxide = "=1.7.4"
+peeroxide-dht = "=1.7.4"
+libudx = "=1.7.4"
+tokio.workspace = true
+clap.workspace = true
+nix.workspace = true
+bytes.workspace = true
+log.workspace = true
+env_logger.workspace = true
+thiserror.workspace = true
+postcard.workspace = true
+
+[dev-dependencies]
+env_logger.workspace = true

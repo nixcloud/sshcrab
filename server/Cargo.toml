@@ -16,3 +16,5 @@ anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
 libc.workspace = true
+postcard.workspace = true
+zeroize.workspace = true

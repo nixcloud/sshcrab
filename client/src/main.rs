@@ -35,6 +35,10 @@ struct Args {
     /// Trust an unknown host key without asking (never overrides a mismatch).
     #[arg(long)]
     accept_new: bool,
+    /// DHT bootstrap node for `.p2p` hosts (`host:port`); repeatable. Overrides
+    /// `P2PBootstrap` in ~/.sshcrab/config.toml.
+    #[arg(long, value_name = "HOST:PORT")]
+    bootstrap: Vec<String>,
     /// [user@]host [command…]
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true, value_name = "[USER@]HOST [COMMAND]")]
     rest: Vec<String>,
@@ -102,7 +106,11 @@ async fn run(args: Args) -> i32 {
     let target = Target { user, host, port: args.port };
 
     local::gc();
-    let connector = match Connector::new(target.clone(), args.accept_new) {
+    let config = match local::Config::load() {
+        Ok(c) => c,
+        Err(e) => return fail(e, 255),
+    };
+    let connector = match Connector::new(target.clone(), args.accept_new, config.bootstrap(&args.bootstrap)) {
         Ok(c) => c,
         Err(e) => return fail(e, 255),
     };
@@ -124,6 +132,9 @@ async fn run(args: Args) -> i32 {
     }
     if args.accept_new {
         resume_command.push_str(" --accept-new");
+    }
+    for b in &args.bootstrap {
+        resume_command.push_str(&format!(" --bootstrap {}", shell_quote(b)));
     }
     resume_command.push(' ');
     resume_command.push_str(&shell_quote(&format!("{}@{}", target.user, target.host)));
@@ -250,8 +261,8 @@ async fn attach_mode(
         }
     };
 
-    let (id, replay) = match request(&mut sc, Ctrl::Attach(attach)).await {
-        Some(Ctrl::Attached { id, replay, .. }) => (id, replay),
+    let (id, replay, terminal) = match request(&mut sc, Ctrl::Attach(attach)).await {
+        Some(Ctrl::Attached { id, replay, terminal, .. }) => (id, replay, terminal),
         Some(Ctrl::AttachRefused { reason }) => {
             let msg = match reason {
                 AttachRefusal::NotFound => "session not found",
@@ -268,9 +279,11 @@ async fn attach_mode(
     if interactive {
         term::enable_raw();
     }
+    let mut session = Session::new(id, interactive);
+    session.enter_terminal(&terminal);
     let runner = Runner {
         connector,
-        session: Session::new(id, interactive),
+        session,
         stdin: attach::stdin_reader(),
         resume_command: resume_command.replace("{id}", &id.to_string()),
     };

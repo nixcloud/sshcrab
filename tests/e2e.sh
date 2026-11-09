@@ -81,6 +81,14 @@ if [ "${1:-}" != --skip-reconnect ]; then
     check "reconnect status line was shown" "grep -q 'reconnecting… (elapsed' '$T/rc.err'"
 fi
 
+# Last: stopping the daemon tells attached clients instead of leaving them to reconnect.
+"$B/sshcrab" -p $PORT 127.0.0.1 "$P sleep 600" </dev/null 2> "$T/sd.err" &
+CL=$!
+sleep 1.5
+kill -INT $DAEMON
+timeout 10 tail --pid=$CL -f /dev/null; wait $CL; code=$?
+check "daemon shutdown disconnects clients with a reason" "[ $code = 255 ] && grep -q 'shutting down' '$T/sd.err'"
+
 echo "$PASS passed, $FAIL failed"
 [ $FAIL = 0 ] || { echo "--- daemon log:"; tail -20 "$T/daemon.log"; }
 [ $FAIL = 0 ]

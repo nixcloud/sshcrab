@@ -15,6 +15,37 @@ pub fn dir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// `~/.sshcrab/config.toml` (spec §8). Missing file = defaults.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Config {
+    /// DHT bootstrap nodes for `.p2p` hosts; empty = the built-in list.
+    #[serde(rename = "P2PBootstrap")]
+    pub p2p_bootstrap: Vec<String>,
+}
+
+impl Config {
+    pub fn load() -> Result<Config, String> {
+        let path = dir()?.join("config.toml");
+        match std::fs::read_to_string(&path) {
+            Ok(s) => toml::from_str(&s).map_err(|e| format!("{}: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        }
+    }
+
+    /// `--bootstrap` wins over the file, the file over the built-in list.
+    pub fn bootstrap(&self, flags: &[String]) -> Vec<String> {
+        if !flags.is_empty() {
+            flags.to_vec()
+        } else if !self.p2p_bootstrap.is_empty() {
+            self.p2p_bootstrap.clone()
+        } else {
+            sshcrab_proto::p2p::DEFAULT_BOOTSTRAP.iter().map(|s| s.to_string()).collect()
+        }
+    }
+}
+
 /// `~/.sshcrab/sessions/<PID>/session` while this client is attached.
 pub struct SessionFile {
     dir: PathBuf,

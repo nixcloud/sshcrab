@@ -19,6 +19,22 @@ pub struct Config {
     pub max_unauth_per_source: usize,
     pub session_buffer_bytes: usize,
     pub disconnected_timeout: String,
+    /// Reachable through the DHT via the sshcrabd-p2p helper (spec §13).
+    #[serde(rename = "P2P")]
+    pub p2p: bool,
+    /// Control socket for sshcrabd-p2p.
+    #[serde(rename = "P2PSocket")]
+    pub p2p_socket: String,
+    /// The only user sshcrabd-p2p may connect as (sshcrabd as root).
+    #[serde(rename = "P2PUser")]
+    pub p2p_user: String,
+    /// DHT bootstrap nodes; empty = the built-in list.
+    #[serde(rename = "P2PBootstrap")]
+    pub p2p_bootstrap: Vec<String>,
+    /// Unauthenticated P2P connections at once (they share one bucket, the
+    /// client addresses are unknown).
+    #[serde(rename = "MaxUnauthP2P")]
+    pub max_unauth_p2p: usize,
 }
 
 impl Default for Config {
@@ -33,6 +49,11 @@ impl Default for Config {
             max_unauth_per_source: 8,
             session_buffer_bytes: 1 << 20,
             disconnected_timeout: "24h".into(),
+            p2p: false,
+            p2p_socket: "/run/sshcrab/p2p.sock".into(),
+            p2p_user: "sshcrab-p2p".into(),
+            p2p_bootstrap: vec![],
+            max_unauth_p2p: 16,
         }
     }
 }
@@ -58,6 +79,14 @@ impl Config {
                 Ok(addr)
             })
             .collect()
+    }
+
+    pub fn bootstrap(&self) -> Vec<String> {
+        if self.p2p_bootstrap.is_empty() {
+            sshcrab_proto::p2p::DEFAULT_BOOTSTRAP.iter().map(|s| s.to_string()).collect()
+        } else {
+            self.p2p_bootstrap.clone()
+        }
     }
 
     pub fn disconnected_timeout(&self) -> Result<Duration, String> {
@@ -99,6 +128,9 @@ mod tests {
         assert_eq!(c.addresses(Some(20202)).unwrap(), vec!["127.0.0.1:20202".parse().unwrap()]);
         assert_eq!(Config::default().addresses(None).unwrap().len(), 2);
         assert!(toml::from_str::<Config>("Bogus = 1").is_err());
+        let c: Config = toml::from_str("P2P = true\nP2PBootstrap = [\"10.0.0.1:49737\"]").unwrap();
+        assert!(c.p2p && c.bootstrap() == ["10.0.0.1:49737"]);
+        assert_eq!(Config::default().bootstrap()[0], "bootstrap.nixcloud.io:49737");
     }
 
     #[test]

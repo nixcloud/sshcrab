@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use sshcrab_proto::channel::{Msg, SecureConn};
 use sshcrab_proto::transport::KEEPALIVE;
+use sshcrab_proto::vt::Modes;
 use sshcrab_proto::wire::{Attach, AttachRefusal, Ctrl, Data, DataStream, MAX_CHUNK, Offsets};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
@@ -37,11 +38,43 @@ pub struct Session {
     /// Visible characters since the last newline, to put the cursor back after
     /// the reconnect status line.
     col: usize,
+    /// Terminal modes the session's output switched on, to undo when leaving.
+    modes: Modes,
 }
 
 impl Session {
     pub fn new(id: Uuid, interactive: bool) -> Self {
-        Session { id, interactive, received: Offsets::default(), stdin_buf: VecDeque::new(), stdin_acked: 0, stdin_eof: false, col: 0 }
+        Session {
+            id,
+            interactive,
+            received: Offsets::default(),
+            stdin_buf: VecDeque::new(),
+            stdin_acked: 0,
+            stdin_eof: false,
+            col: 0,
+            modes: Modes::default(),
+        }
+    }
+
+    /// Put the local terminal into the modes the server says the program uses.
+    pub fn enter_terminal(&mut self, seq: &[u8]) {
+        if self.interactive && !seq.is_empty() {
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(seq);
+            let _ = out.flush();
+            self.modes.feed(seq);
+        }
+    }
+
+    /// Undo those modes (alternate screen, mouse reporting, …) before leaving
+    /// the session for good, so the local shell works normally again.
+    fn leave_terminal(&mut self) {
+        let seq = std::mem::take(&mut self.modes).reset();
+        if !seq.is_empty() {
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(&seq);
+            let _ = out.flush();
+        }
     }
 
     fn track_column(&mut self, data: &[u8]) {
@@ -86,6 +119,13 @@ pub fn stdin_reader() -> mpsc::Receiver<Option<Vec<u8>>> {
     rx
 }
 
+/// Say goodbye, then wait until the server hangs up so the Close is delivered
+/// before this process exits.
+async fn goodbye(sc: &mut SecureConn) {
+    let _ = sc.send_ctrl(&Ctrl::Close).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), async { while sc.recv().await.is_ok() {} }).await;
+}
+
 enum End {
     Exit(i32),
     Kicked(String),
@@ -105,19 +145,27 @@ impl Runner<'_> {
         loop {
             match self.attached(&mut sc, replay).await {
                 End::Exit(code) => {
-                    // Say goodbye, then wait until the server hangs up so the
-                    // Close is delivered before this process exits.
-                    let _ = sc.send_ctrl(&Ctrl::Close).await;
-                    let _ = tokio::time::timeout(Duration::from_secs(3), async { while sc.recv().await.is_ok() {} }).await;
+                    goodbye(&mut sc).await;
+                    self.session.leave_terminal();
                     return Outcome::Exit(code);
                 }
-                End::Kicked(reason) => return Outcome::Kicked(reason),
+                End::Kicked(reason) => {
+                    goodbye(&mut sc).await;
+                    self.session.leave_terminal();
+                    if self.session.col > 0 {
+                        eprint!("\r\n");
+                    }
+                    return Outcome::Kicked(reason);
+                }
                 End::Lost => match self.reconnect().await {
                     Ok((new, r)) => {
                         sc = new;
                         replay = r;
                     }
-                    Err(outcome) => return outcome,
+                    Err(outcome) => {
+                        self.session.leave_terminal();
+                        return outcome;
+                    }
                 },
             }
         }
@@ -207,6 +255,9 @@ impl Runner<'_> {
                         if stream == DataStream::Stdout {
                             let mut out = std::io::stdout().lock();
                             let _ = out.write_all(new);
+                            if self.session.interactive {
+                                self.session.modes.feed(new);
+                            }
                             let _ = out.flush();
                         } else {
                             let _ = std::io::stderr().lock().write_all(new);
@@ -337,6 +388,7 @@ impl Runner<'_> {
             Ok(sc) => sc,
             Err(ConnectError::Transient(_)) => return Err(None),
             Err(ConnectError::Fatal(msg)) => {
+                self.session.leave_terminal();
                 term::restore();
                 eprintln!("\r\nsshcrab: {msg}");
                 return Err(Some(Outcome::Exit(255)));
@@ -349,7 +401,8 @@ impl Runner<'_> {
         }
         loop {
             match sc.recv().await {
-                Ok(Msg::Ctrl(Ctrl::Attached { replay, lost_bytes, .. })) => {
+                Ok(Msg::Ctrl(Ctrl::Attached { replay, lost_bytes, terminal, .. })) => {
+                    self.session.enter_terminal(&terminal);
                     if lost_bytes > 0 {
                         eprint!("\r\n[sshcrab: {lost_bytes} bytes of output were lost while disconnected]\r\n");
                     }
@@ -362,7 +415,8 @@ impl Runner<'_> {
         }
     }
 
-    fn abort(&self) -> Outcome {
+    fn abort(&mut self) -> Outcome {
+        self.session.leave_terminal();
         let mut err = std::io::stderr().lock();
         let _ = write!(err, "\r\x1b[K");
         let _ = err.flush();

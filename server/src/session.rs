@@ -5,6 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use sshcrab_proto::vt::Modes;
 use sshcrab_proto::wire::{
     AttachRefusal, Ctrl, Data, DataStream, ExitStatus, MAX_CHUNK, Offsets, SessionInfo,
 };
@@ -43,19 +44,21 @@ pub enum ToSession {
 pub enum ToClient {
     Data(Data),
     Ctrl(Ctrl),
-    /// Send `Kicked` and disconnect.
-    Kicked(String),
 }
 
 pub struct Client {
     pub id: u64,
     pub tx: mpsc::Sender<ToClient>,
+    /// Reason to send `Kicked` and disconnect. Separate from `tx` so a full
+    /// output queue cannot lose it (the client would reconnect and take over back).
+    pub kick: oneshot::Sender<String>,
 }
 
 pub struct Attached {
     pub id: Uuid,
     pub replay: Offsets,
     pub lost_bytes: u64,
+    pub terminal: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -163,6 +166,15 @@ impl Manager {
         Ok((id, tx))
     }
 
+    /// Daemon shutdown, first step: tell every attached client why it is disconnected,
+    /// so it exits instead of reconnecting to sessions that will be gone.
+    pub async fn kick_all(&self, reason: &str) {
+        let txs: Vec<_> = self.sessions.lock().unwrap().values().map(|e| e.tx.clone()).collect();
+        for tx in txs {
+            let _ = tx.send(ToSession::Kick { reason: reason.into() }).await;
+        }
+    }
+
     /// Daemon shutdown: end all session processes.
     pub fn kill_all(&self) {
         for e in self.sessions.lock().unwrap().values() {
@@ -187,7 +199,12 @@ fn base_env(acc: &Account) -> Vec<(String, String)> {
     ]
 }
 
-/// Unacknowledged output of one stream, addressed by absolute byte offset.
+/// Acknowledged output an interactive session keeps, so a new client sees the
+/// recent screen instead of an empty one.
+const HISTORY: usize = 64 * 1024;
+
+/// Unacknowledged output of one stream (plus `keep` bytes of history),
+/// addressed by absolute byte offset.
 struct OutBuf {
     /// Offset of `buf[0]`.
     start: u64,
@@ -195,17 +212,19 @@ struct OutBuf {
     /// Next offset to send to the attached client.
     sent: u64,
     eof: bool,
+    /// Acknowledged bytes retained at the end of the buffer.
+    keep: usize,
 }
 
 impl OutBuf {
-    fn new() -> Self {
-        OutBuf { start: 0, buf: VecDeque::new(), sent: 0, eof: false }
+    fn new(keep: usize) -> Self {
+        OutBuf { start: 0, buf: VecDeque::new(), sent: 0, eof: false, keep }
     }
     fn end(&self) -> u64 {
         self.start + self.buf.len() as u64
     }
     fn ack(&mut self, offset: u64) {
-        let offset = offset.min(self.sent);
+        let offset = offset.min(self.sent).min(self.end().saturating_sub(self.keep as u64));
         if offset > self.start {
             self.buf.drain(..(offset - self.start) as usize);
             self.start = offset;
@@ -250,6 +269,8 @@ struct Actor {
     stdin_eof_at: Option<u64>,
     exit: Option<ExitStatus>,
     exit_sent: bool,
+    /// Terminal modes set by the session's output (interactive only).
+    modes: Modes,
     client: Option<Client>,
     disconnected: Option<Instant>,
 }
@@ -267,12 +288,13 @@ impl Actor {
             interactive,
             pid,
             cap,
-            out: OutBuf::new(),
-            err: OutBuf::new(),
+            out: OutBuf::new(if interactive { HISTORY.min(cap) } else { 0 }),
+            err: OutBuf::new(0),
             stdin_offset: 0,
             stdin_eof_at: None,
             exit: None,
             exit_sent: false,
+            modes: Modes::default(),
             client: None,
             disconnected: Some(Instant::now()),
         }
@@ -321,7 +343,7 @@ impl Actor {
             tokio::select! {
                 msg = rx.recv() => match msg {
                     Some(m) => {
-                        if self.handle(m, pty.as_deref(), &mut in_tx).await {
+                        if self.handle(m, pty.as_ref(), &mut in_tx).await {
                             break;
                         }
                     }
@@ -330,7 +352,10 @@ impl Actor {
                 Some((stream, data)) = out_rx.recv(), if room => {
                     let buf = if stream == DataStream::Stderr { &mut self.err } else { &mut self.out };
                     match data {
-                        Some(d) if self.interactive => buf.push_ring(&d, self.cap),
+                        Some(d) if self.interactive => {
+                            self.modes.feed(&d);
+                            buf.push_ring(&d, self.cap)
+                        }
                         Some(d) => buf.buf.extend(d),
                         None => buf.eof = true,
                     }
@@ -386,6 +411,7 @@ impl Actor {
 
     async fn drain_pty_output(&mut self, out_rx: &mut mpsc::Receiver<(DataStream, Option<Vec<u8>>)>) {
         while let Ok(Some((_, Some(d)))) = tokio::time::timeout(Duration::from_millis(50), out_rx.recv()).await {
+            self.modes.feed(&d);
             self.out.push_ring(&d, self.cap);
         }
     }
@@ -421,15 +447,20 @@ impl Actor {
     }
 
     /// Returns true when the session ends.
-    async fn handle(&mut self, msg: ToSession, pty: Option<&sys::PtyMaster>, in_tx: &mut Option<mpsc::Sender<Input>>) -> bool {
+    async fn handle(
+        &mut self,
+        msg: ToSession,
+        pty: Option<&Arc<sys::PtyMaster>>,
+        in_tx: &mut Option<mpsc::Sender<Input>>,
+    ) -> bool {
         match msg {
             ToSession::Attach { client, received, window, takeover, reply } => {
-                if let Some(old) = &self.client {
-                    if !takeover {
-                        let _ = reply.send(Err(AttachRefusal::AttachedElsewhere));
-                        return false;
-                    }
-                    let _ = old.tx.try_send(ToClient::Kicked("your session has been taken over by a different user".into()));
+                if self.client.is_some() && !takeover {
+                    let _ = reply.send(Err(AttachRefusal::AttachedElsewhere));
+                    return false;
+                }
+                if let Some(old) = self.client.take() {
+                    let _ = old.kick.send("your session was taken over by another client".into());
                     log::info!("session {} taken over", self.id);
                 }
                 let mut lost = 0;
@@ -437,20 +468,50 @@ impl Actor {
                     // Never trust client offsets beyond what exists.
                     let got = got.min(buf.end());
                     if got < buf.start {
-                        lost += buf.start - got;
+                        // A client that has nothing yet is not missing anything:
+                        // it continues where the last one left off.
+                        if got > 0 {
+                            lost += buf.start - got;
+                        }
+                        buf.sent = buf.start;
+                        // Interactive history may start mid-line; show it from the
+                        // first full line on.
+                        if got == 0 && buf.keep > 0 {
+                            let line = buf.buf.iter().take(4096).position(|&b| b == b'\n').map_or(0, |i| i + 1);
+                            buf.sent += line as u64;
+                        }
+                    } else {
+                        buf.sent = got;
                     }
-                    buf.sent = got.max(buf.start);
                     buf.ack(buf.sent);
                 }
-                if let (Some(p), Some((c, r))) = (pty, window) {
-                    p.set_size(c, r);
+                // A fresh terminal has none of the modes the program set long ago.
+                let fresh = self.interactive && received.stdout == 0;
+                let terminal = if fresh { self.modes.restore() } else { Vec::new() };
+                if fresh && self.modes.alt_screen() {
+                    // A full-screen program redraws (below); its old frames would only
+                    // scroll by on a screen of a different size.
+                    self.out.sent = self.out.end();
+                    self.out.ack(self.out.sent);
+                }
+                if let Some(p) = pty {
+                    if let Some((c, r)) = window {
+                        p.set_size(c, r);
+                    }
+                    // Output an earlier client acknowledged is not replayed, so the
+                    // new screen stays empty unless the program redraws.
+                    if fresh && self.modes.alt_screen() {
+                        p.repaint();
+                    } else {
+                        p.redraw();
+                    }
                 }
                 let replay = Offsets { stdin: self.stdin_offset, stdout: self.out.sent, stderr: self.err.sent };
                 self.client = Some(client);
                 self.exit_sent = false;
                 self.disconnected = None;
                 self.mgr.set_disconnected(&self.id, None);
-                let _ = reply.send(Ok(Attached { id: self.id, replay, lost_bytes: lost }));
+                let _ = reply.send(Ok(Attached { id: self.id, replay, lost_bytes: lost, terminal }));
             }
             ToSession::Detached { client_id } => {
                 if self.client.as_ref().is_some_and(|c| c.id == client_id) {
@@ -493,8 +554,7 @@ impl Actor {
             ToSession::Close | ToSession::Remove => return true,
             ToSession::Kick { reason } => {
                 if let Some(c) = self.client.take() {
-                    let _ = c.tx.try_send(ToClient::Kicked(reason));
-                    self.client = Some(c);
+                    let _ = c.kick.send(reason);
                     self.detach();
                 }
             }
@@ -591,7 +651,7 @@ mod tests {
 
     #[test]
     fn outbuf_ack_and_ring() {
-        let mut b = OutBuf::new();
+        let mut b = OutBuf::new(0);
         b.buf.extend(b"hello world");
         let (o, d) = b.next_chunk().unwrap();
         assert_eq!((o, d.as_slice()), (0, &b"hello world"[..]));
@@ -603,5 +663,15 @@ mod tests {
         assert_eq!(b.start, 17);
         assert_eq!(b.sent, 17);
         assert_eq!(b.next_chunk().unwrap(), (17, b"6789".to_vec()));
+    }
+
+    #[test]
+    fn outbuf_keeps_history() {
+        let mut b = OutBuf::new(4);
+        b.buf.extend(b"hello world");
+        b.next_chunk().unwrap();
+        b.ack(11);
+        assert_eq!((b.start, b.buf.len()), (7, 4));
+        assert!(!b.unsent());
     }
 }

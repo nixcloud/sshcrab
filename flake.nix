@@ -53,15 +53,19 @@
           packages.sshcrab = joinBins "sshcrab" "sshcrab";
           # bin/sshcrabd
           packages.sshcrabd = joinBins "sshcrabd" "sshcrabd";
+          # bin/sshcrabd-p2p (P2P helper) and bin/sshcrab-dht-node (bootstrap node)
+          packages.sshcrab-p2p = joinBins "sshcrab-p2p" "sshcrab-p2p";
           packages.default = pkgs.symlinkJoin {
             name = "sshcrab-all";
-            paths = [ packages.sshcrab packages.sshcrabd ];
+            paths = [ packages.sshcrab packages.sshcrabd packages.sshcrab-p2p ];
           };
 
           devShells.default = pkgs.mkShell {
             buildInputs = [
               rust_toolchain
               pkgs.cargo-binutils
+              pkgs.tmux
+              pkgs.tcpdump
             ];
             shellHook = ''
               export CARGO_BACKEND=nix

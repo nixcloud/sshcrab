@@ -26,7 +26,7 @@ use sctp_proto::{
     EndpointEvent, Event, Payload, PayloadProtocolIdentifier, ServerConfig, StreamEvent, TransportConfig,
 };
 use tokio::net::UdpSocket;
-use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
+use tokio::sync::{Notify, Semaphore, mpsc, oneshot, watch};
 
 pub const STREAM_CTRL: u16 = 0;
 pub const STREAM_DATA: u16 = 1;
@@ -99,8 +99,36 @@ fn transport_config() -> TransportConfig {
         .with_remote_port(SCTP_PORT)
 }
 
-/// An established association.
+/// Where a connection comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Remote {
+    Udp(SocketAddr),
+    /// Through the P2P backend; the address is often unknown (spec §13).
+    P2p(Option<SocketAddr>),
+}
+
+impl std::fmt::Display for Remote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Remote::Udp(a) => write!(f, "{a}"),
+            Remote::P2p(Some(a)) => write!(f, "p2p:{a}"),
+            Remote::P2p(None) => write!(f, "p2p"),
+        }
+    }
+}
+
+/// An established connection: an SCTP association, or a message pipe whose
+/// other end a bridge task connects to a byte stream (spec §13.1).
 pub struct Conn {
+    inner: Inner,
+}
+
+enum Inner {
+    Sctp(SctpConn),
+    Pipe(PipeConn),
+}
+
+struct SctpConn {
     remote: SocketAddr,
     handle: AssociationHandle,
     cmd: mpsc::UnboundedSender<Cmd>,
@@ -109,9 +137,38 @@ pub struct Conn {
     kick: Arc<Notify>,
 }
 
+struct PipeConn {
+    remote: Remote,
+    tx: mpsc::Sender<(u16, Bytes)>,
+    rx: mpsc::Receiver<(u16, Bytes)>,
+    close: watch::Sender<bool>,
+}
+
+/// The bridge's side of a pipe [`Conn`].
+pub struct PipeEnds {
+    /// Messages the application sent; ends when it closed or dropped the `Conn`.
+    pub outgoing: mpsc::Receiver<(u16, Bytes)>,
+    /// Messages for the application.
+    pub incoming: mpsc::Sender<(u16, Bytes)>,
+    /// Becomes true on `Conn::close()`: finish sending what is queued, then hang up.
+    pub closed: watch::Receiver<bool>,
+}
+
 impl Conn {
-    pub fn remote(&self) -> SocketAddr {
-        self.remote
+    /// A connection carried by a bridge task over some other transport.
+    pub fn pipe(remote: Remote) -> (Conn, PipeEnds) {
+        let (out_tx, out_rx) = mpsc::channel(RECV_QUEUE);
+        let (in_tx, in_rx) = mpsc::channel(RECV_QUEUE);
+        let (close, closed) = watch::channel(false);
+        let conn = Conn { inner: Inner::Pipe(PipeConn { remote, tx: out_tx, rx: in_rx, close }) };
+        (conn, PipeEnds { outgoing: out_rx, incoming: in_tx, closed })
+    }
+
+    pub fn remote(&self) -> Remote {
+        match &self.inner {
+            Inner::Sctp(c) => Remote::Udp(c.remote),
+            Inner::Pipe(p) => p.remote,
+        }
     }
 
     /// Queue one message. Waits while more than the send window is unacknowledged.
@@ -119,27 +176,45 @@ impl Conn {
         if data.len() > MAX_MESSAGE {
             return Err(TransportError::TooLarge(data.len()));
         }
-        let permits = data.len().max(1) as u32;
-        self.window.acquire_many(permits).await.map_err(|_| TransportError::Closed)?.forget();
-        self.cmd
-            .send(Cmd::Send { handle: self.handle, stream, data, permits })
-            .map_err(|_| TransportError::Closed)?;
-        self.kick.notify_one();
-        Ok(())
+        match &self.inner {
+            Inner::Sctp(c) => {
+                let permits = data.len().max(1) as u32;
+                c.window.acquire_many(permits).await.map_err(|_| TransportError::Closed)?.forget();
+                c.cmd
+                    .send(Cmd::Send { handle: c.handle, stream, data, permits })
+                    .map_err(|_| TransportError::Closed)?;
+                c.kick.notify_one();
+                Ok(())
+            }
+            Inner::Pipe(p) => p.tx.send((stream, data)).await.map_err(|_| TransportError::Closed),
+        }
     }
 
-    /// Next message, or `None` once the association is lost or closed.
+    /// Next message, or `None` once the connection is lost or closed.
     pub async fn recv(&mut self) -> Option<(u16, Bytes)> {
-        let msg = self.rx.recv().await;
-        // Room in the queue again: let the driver read more from SCTP.
-        self.kick.notify_one();
-        msg
+        match &mut self.inner {
+            Inner::Sctp(c) => {
+                let msg = c.rx.recv().await;
+                // Room in the queue again: let the driver read more from SCTP.
+                c.kick.notify_one();
+                msg
+            }
+            // The same dead-peer rule as for SCTP: the peer pings every `KEEPALIVE`.
+            Inner::Pipe(p) => tokio::time::timeout(IDLE_TIMEOUT, p.rx.recv()).await.ok().flatten(),
+        }
     }
 
-    /// Graceful SCTP shutdown (after queued data is delivered).
+    /// Graceful shutdown (after queued data is delivered).
     pub fn close(&self) {
-        let _ = self.cmd.send(Cmd::Close(self.handle));
-        self.kick.notify_one();
+        match &self.inner {
+            Inner::Sctp(c) => {
+                let _ = c.cmd.send(Cmd::Close(c.handle));
+                c.kick.notify_one();
+            }
+            Inner::Pipe(p) => {
+                let _ = p.close.send(true);
+            }
+        }
     }
 }
 
@@ -496,14 +571,14 @@ impl Driver {
                     match ev {
                         Event::Connected => {
                             s.established = true;
-                            let conn = Conn {
+                            let conn = Conn { inner: Inner::Sctp(SctpConn {
                                 remote: s.remote,
                                 handle,
                                 cmd: self.cmd_tx.clone(),
                                 window: s.window.clone(),
                                 rx: s.conn_rx.take().expect("connected once"),
                                 kick: self.kick.clone(),
-                            };
+                            }) };
                             match s.on_connected.take() {
                                 Some(done) => {
                                     let _ = done.send(Ok(conn));

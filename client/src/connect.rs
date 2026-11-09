@@ -10,7 +10,7 @@ use sshcrab_proto::channel::SecureConn;
 use sshcrab_proto::handshake::{self, HandshakeError};
 use sshcrab_proto::hostkeys::{self, Lookup};
 use sshcrab_proto::keys::{self, Identity};
-use sshcrab_proto::transport;
+use sshcrab_proto::{p2p, transport};
 
 use crate::{local, ui};
 
@@ -36,22 +36,39 @@ impl ConnectError {
     }
 }
 
+/// DHT lookup plus hole punching (up to about 40 s, spec §13).
+const P2P_TIMEOUT: Duration = Duration::from_secs(45);
+
 pub struct Connector {
     pub target: Target,
     identity: Identity,
     hostkeys: PathBuf,
     accept_new: bool,
+    bootstrap: Vec<String>,
 }
 
 impl Connector {
-    pub fn new(target: Target, accept_new: bool) -> Result<Connector, String> {
+    pub fn new(target: Target, accept_new: bool, bootstrap: Vec<String>) -> Result<Connector, String> {
         let dir = local::dir()?;
         let key_path = dir.join("id_ed25519");
         if key_path.symlink_metadata().is_err() {
             return Err(format!("no key at {}; create one with: sshcrab-keygen-ed25519 {}", key_path.display(), key_path.display()));
         }
         let identity = Identity::load(&key_path).map_err(|e| e.to_string())?;
-        Ok(Connector { target, identity, hostkeys: dir.join("hostkeys"), accept_new })
+        Ok(Connector { target, identity, hostkeys: dir.join("hostkeys"), accept_new, bootstrap })
+    }
+
+    /// A `.p2p` address has no port; hostkeys stores 0 for it.
+    fn hostkey_port(&self) -> u16 {
+        if p2p::parse_address(&self.target.host).is_some() { 0 } else { self.target.port }
+    }
+
+    fn label(&self) -> String {
+        if p2p::parse_address(&self.target.host).is_some() {
+            self.target.host.clone()
+        } else {
+            format!("{} port {}", self.target.host, self.target.port)
+        }
     }
 
     async fn resolve(&self) -> Result<SocketAddr, ConnectError> {
@@ -66,16 +83,25 @@ impl Connector {
     /// with `--accept-new`), stored, and the connection retried.
     pub async fn connect(&self, interactive_prompts: bool) -> Result<SecureConn, ConnectError> {
         for _ in 0..2 {
-            let addr = self.resolve().await?;
-            let conn = tokio::time::timeout(Duration::from_secs(10), transport::connect(addr))
-                .await
-                .map_err(|_| ConnectError::Transient(format!("{addr}: timed out")))?
-                .map_err(|e| ConnectError::Transient(format!("{addr}: {e}")))?;
+            let conn = match p2p::parse_address(&self.target.host) {
+                // Lookup and hole punching can take a while (spec §13).
+                Some(key) => tokio::time::timeout(P2P_TIMEOUT, sshcrab_p2p::connect(&self.bootstrap, key))
+                    .await
+                    .map_err(|_| ConnectError::Transient(format!("{}: no connection through the DHT", self.target.host)))?
+                    .map_err(|e| ConnectError::Transient(format!("{}: {e}", self.target.host)))?,
+                None => {
+                    let addr = self.resolve().await?;
+                    tokio::time::timeout(Duration::from_secs(10), transport::connect(addr))
+                        .await
+                        .map_err(|_| ConnectError::Transient(format!("{addr}: timed out")))?
+                        .map_err(|e| ConnectError::Transient(format!("{addr}: {e}")))?
+                }
+            };
 
             let contents = std::fs::read_to_string(&self.hostkeys).unwrap_or_default();
             let unknown = Cell::new(None);
             let mismatch = Cell::new(None);
-            let (host, port) = (&self.target.host, self.target.port);
+            let (host, port, label) = (&self.target.host, self.hostkey_port(), self.label());
             let check = |key: &[u8; 32]| match hostkeys::lookup(&contents, host, port, key) {
                 Lookup::Known => Ok(()),
                 Lookup::Mismatch { line } => {
@@ -98,7 +124,7 @@ impl Connector {
                 Err(HandshakeError::HostKeyRejected(_)) => {
                     if let Some((line, key)) = mismatch.get() {
                         return Err(ConnectError::Fatal(format!(
-                            "HOST KEY MISMATCH for {host} port {port}: the server presented {}, \
+                            "HOST KEY MISMATCH for {label}: the server presented {}, \
                              which does not match ~/.sshcrab/hostkeys:{line}\n\
                              If the host key was changed on purpose, delete that line and connect again.",
                             keys::fingerprint(&key)
@@ -124,22 +150,22 @@ impl Connector {
     }
 
     fn trust_new(&self, key: &[u8; 32], interactive_prompts: bool) -> Result<(), ConnectError> {
-        let (host, port) = (&self.target.host, self.target.port);
+        let (host, port, label) = (&self.target.host, self.hostkey_port(), self.label());
         let fp = keys::fingerprint(key);
         if !self.accept_new {
             if !interactive_prompts || !std::io::stdin().is_terminal() {
                 return Err(ConnectError::Fatal(format!(
-                    "unknown host key for {host} port {port} ({fp}); use --accept-new to trust it"
+                    "unknown host key for {label} ({fp}); use --accept-new to trust it"
                 )));
             }
-            let ok = ui::confirm(&format!("The host {host} port {port} is unknown. Its key fingerprint is {fp}. Trust it?"));
+            let ok = ui::confirm(&format!("The host {label} is unknown. Its key fingerprint is {fp}. Trust it?"));
             if !ok {
                 return Err(ConnectError::Fatal("host key not trusted".into()));
             }
         }
         hostkeys::append(&self.hostkeys, host, port, key)
             .map_err(|e| ConnectError::Fatal(format!("{}: {e}", self.hostkeys.display())))?;
-        eprintln!("Added {host} port {port} ({fp}) to ~/.sshcrab/hostkeys");
+        eprintln!("Added {label} ({fp}) to ~/.sshcrab/hostkeys");
         Ok(())
     }
 }

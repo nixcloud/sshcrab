@@ -66,7 +66,7 @@ impl SecureConn {
         SecureConn { conn, noise, send_ctr: [0; 2], recv_ctr: [0; 2], compress: false }
     }
 
-    pub fn remote(&self) -> std::net::SocketAddr {
+    pub fn remote(&self) -> crate::transport::Remote {
         self.conn.remote()
     }
 

@@ -58,6 +58,16 @@ impl Identity {
         self.signing.sign(msg).to_bytes()
     }
 
+    /// Seed of the P2P key (spec §13.2): derived, so the host key itself never
+    /// reaches the P2P stack, and stable for as long as the host key is.
+    pub fn p2p_seed(&self) -> Zeroizing<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(crate::p2p::SEED_LABEL);
+        h.update(self.signing.to_bytes());
+        Zeroizing::new(h.finalize().into())
+    }
+
     fn to_ssh(&self, comment: &str) -> PrivateKey {
         let keypair = Ed25519Keypair::from_seed(&self.signing.to_bytes());
         PrivateKey::new(KeypairData::Ed25519(keypair), comment).expect("ed25519 key")

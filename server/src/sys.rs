@@ -5,6 +5,7 @@ use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::process::Stdio;
+use std::sync::Arc;
 
 use tokio::io::unix::AsyncFd;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
@@ -195,5 +196,42 @@ impl PtyMaster {
 
     pub fn set_size(&self, cols: u16, rows: u16) {
         let _ = set_winsize(self.fd.get_ref().as_raw_fd(), cols, rows);
+    }
+
+    fn size(&self) -> Option<(u16, u16)> {
+        let mut ws = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
+        // SAFETY: TIOCGWINSZ with a valid winsize pointer.
+        let r = unsafe { libc::ioctl(self.fd.get_ref().as_raw_fd(), libc::TIOCGWINSZ, &mut ws) };
+        (r == 0).then_some((ws.ws_col, ws.ws_row))
+    }
+
+    /// Make a full-screen program repaint everything, for a terminal that shows
+    /// nothing of it yet. A SIGWINCH at an unchanged size only makes curses
+    /// programs update what they think changed, so shrink by a row and grow back.
+    pub fn repaint(self: &Arc<Self>) {
+        let Some((cols, rows)) = self.size().filter(|&(_, r)| r > 1) else {
+            return self.redraw();
+        };
+        self.set_size(cols, rows - 1);
+        let pty = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            // Unless the client resized in the meantime.
+            if pty.size() == Some((cols, rows - 1)) {
+                pty.set_size(cols, rows);
+            }
+        });
+    }
+
+    /// Make the terminal's foreground job redraw, as after a resize: SIGWINCH to
+    /// the foreground process group (always one inside the session).
+    pub fn redraw(&self) {
+        // SAFETY: plain syscalls on our own descriptor.
+        unsafe {
+            let pgrp = libc::tcgetpgrp(self.fd.get_ref().as_raw_fd());
+            if pgrp > 0 {
+                libc::killpg(pgrp, libc::SIGWINCH);
+            }
+        }
     }
 }

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Protocol identifier, part of the Noise prologue so a version mismatch fails the handshake.
-pub const PROTOCOL: &[u8] = b"sshcrab/1";
+pub const PROTOCOL: &[u8] = b"sshcrab/2";
 
 /// Largest plaintext payload of one `Data` message (spec §5).
 pub const MAX_CHUNK: usize = 16 * 1024;
@@ -28,7 +28,9 @@ pub enum Ctrl {
     ListSessions,
     Sessions(Vec<SessionInfo>),
     Attach(Attach),
-    Attached { id: Uuid, replay: Offsets, lost_bytes: u64 },
+    /// `terminal`: escape sequences that put a fresh terminal into the modes the
+    /// program set earlier (alternate screen, mouse, …), to write before any output.
+    Attached { id: Uuid, replay: Offsets, lost_bytes: u64, terminal: Vec<u8> },
     /// The requested session needs a decision (it is attached elsewhere).
     AttachRefused { reason: AttachRefusal },
 

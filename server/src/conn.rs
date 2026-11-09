@@ -1,7 +1,8 @@
 //! One authenticated client connection (spec §4.4–4.6).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use sshcrab_proto::channel::{ChannelError, Msg, SecureConn};
 use sshcrab_proto::handshake::Peer;
@@ -31,7 +32,7 @@ pub async fn serve(mut sc: SecureConn, peer: Peer<Account>, mgr: Arc<Manager>) {
     log::info!("{user} authenticated from {} (key {})", sc.remote(), sshcrab_proto::keys::fingerprint(&peer.key));
 
     // Selection phase: list, control, or attach.
-    let (session, client_rx, client_id) = loop {
+    let (session, client_rx, client_id, kick) = loop {
         let msg = match sc.recv().await {
             Ok(Msg::Ctrl(c)) => c,
             Ok(Msg::Data(_)) | Err(_) => return,
@@ -43,15 +44,21 @@ pub async fn serve(mut sc: SecureConn, peer: Peer<Account>, mgr: Arc<Manager>) {
             Ctrl::Attach(attach) => {
                 let (tx, rx) = mpsc::channel(32);
                 let client_id = NEXT_CLIENT.fetch_add(1, Ordering::Relaxed);
-                let client = Client { id: client_id, tx };
+                let (kick_tx, kick_rx) = oneshot::channel();
+                let client = Client { id: client_id, tx, kick: kick_tx };
                 match attach_session(&mgr, &peer.account, attach, client).await {
                     Ok((session, attached)) => {
-                        let ok = Ctrl::Attached { id: attached.id, replay: attached.replay, lost_bytes: attached.lost_bytes };
+                        let ok = Ctrl::Attached {
+                            id: attached.id,
+                            replay: attached.replay,
+                            lost_bytes: attached.lost_bytes,
+                            terminal: attached.terminal,
+                        };
                         if sc.send_ctrl(&ok).await.is_err() {
                             let _ = session.send(ToSession::Detached { client_id }).await;
                             return;
                         }
-                        break (session, rx, client_id);
+                        break (session, rx, client_id, kick_rx);
                     }
                     Err(reason) => Ctrl::AttachRefused { reason },
                 }
@@ -64,7 +71,8 @@ pub async fn serve(mut sc: SecureConn, peer: Peer<Account>, mgr: Arc<Manager>) {
         }
     };
 
-    let end = attached(&mut sc, &session, client_rx).await;
+    let _live = Live::enter();
+    let end = attached(&mut sc, &session, client_rx, kick).await;
     match end {
         End::Lost | End::Kicked => {
             let _ = session.send(ToSession::Detached { client_id }).await;
@@ -82,7 +90,13 @@ enum End {
     Kicked,
 }
 
-async fn attached(sc: &mut SecureConn, session: &mpsc::Sender<ToSession>, mut from_session: mpsc::Receiver<ToClient>) -> End {
+async fn attached(
+    sc: &mut SecureConn,
+    session: &mpsc::Sender<ToSession>,
+    mut from_session: mpsc::Receiver<ToClient>,
+    mut kick: oneshot::Receiver<String>,
+) -> End {
+    let mut kick_done = false;
     loop {
         tokio::select! {
             msg = sc.recv() => {
@@ -115,17 +129,69 @@ async fn attached(sc: &mut SecureConn, session: &mpsc::Sender<ToSession>, mut fr
                 let res = match msg {
                     Some(ToClient::Data(d)) => sc.send_data(&d).await,
                     Some(ToClient::Ctrl(c)) => sc.send_ctrl(&c).await,
-                    Some(ToClient::Kicked(reason)) => {
-                        let _ = sc.send_ctrl(&Ctrl::Kicked { reason }).await;
-                        return End::Kicked;
-                    }
-                    None => return End::Closed,
+                    // A kick drops the client right after; the reason may be waiting.
+                    None => return match kick.try_recv() {
+                        Ok(reason) => kicked(sc, reason).await,
+                        Err(_) => End::Closed,
+                    },
                 };
                 if res.is_err() {
                     return End::Lost;
                 }
             }
+            reason = &mut kick, if !kick_done => {
+                kick_done = true;
+                // An error means the session dropped this client; `from_session` ends too.
+                if let Ok(reason) = reason {
+                    return kicked(sc, reason).await;
+                }
+            }
         }
+    }
+}
+
+async fn kicked(sc: &mut SecureConn, reason: String) -> End {
+    log::info!("{}: disconnecting the client: {reason}", sc.remote());
+    if sc.send_ctrl(&Ctrl::Kicked { reason }).await.is_ok() {
+        // The client answers `Kicked` with `Close`, which shows the reason arrived.
+        let _ = tokio::time::timeout(KICK_LINGER, async {
+            while let Ok(msg) = sc.recv().await {
+                if matches!(msg, Msg::Ctrl(Ctrl::Close)) {
+                    break;
+                }
+            }
+        })
+        .await;
+    }
+    End::Kicked
+}
+
+/// How long a kicked client gets to receive the reason and hang up.
+const KICK_LINGER: Duration = Duration::from_secs(2);
+
+/// Connections attached to a session, so shutdown can wait for their `Kicked`.
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+
+struct Live;
+
+impl Live {
+    fn enter() -> Live {
+        LIVE.fetch_add(1, Ordering::SeqCst);
+        Live
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        LIVE.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Daemon shutdown: wait (at most `limit`) until every attached connection is gone.
+pub async fn wait_detached(limit: Duration) {
+    let until = tokio::time::Instant::now() + limit;
+    while LIVE.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 

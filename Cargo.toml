@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["proto", "client", "server"]
+members = ["proto", "client", "server", "p2p"]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,6 +9,7 @@ license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
 sshcrab-proto = { path = "proto" }
+sshcrab-p2p = { path = "p2p" }
 sctp-proto = "0.10"
 snow = { version = "0.10", default-features = false, features = ["default-resolver", "std", "use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom"] }
 ed25519-dalek = { version = "2", features = ["zeroize"] }
@@ -17,7 +18,7 @@ ruzstd = "0.9"
 postcard = { version = "1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
-nix = { version = "0.31", features = ["user", "process", "signal", "term", "fs", "ioctl", "pthread", "resource", "hostname"] }
+nix = { version = "0.31", features = ["user", "process", "signal", "term", "fs", "ioctl", "pthread", "resource", "hostname", "socket", "uio"] }
 clap = { version = "4", features = ["derive"] }
 cliclack = "0.5"
 uuid = { version = "1", features = ["v4", "serde"] }

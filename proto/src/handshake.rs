@@ -240,6 +240,44 @@ mod tests {
         }
     }
 
+    /// The same handshake and channel over two pipe connections bridged through
+    /// a byte stream, as the P2P backend carries them (spec §13.1).
+    #[tokio::test]
+    async fn works_over_a_bridged_pipe() {
+        use crate::transport::{Conn, Remote};
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (client_conn, client_ends) = Conn::pipe(Remote::P2p(None));
+        let (server_conn, server_ends) = Conn::pipe(Remote::P2p(None));
+        tokio::spawn(crate::p2p::bridge(a, client_ends));
+        tokio::spawn(crate::p2p::bridge(b, server_ends));
+
+        let host = Identity::generate();
+        let user = Identity::generate();
+        let (host_pub, user_pub) = (host.public(), user.public());
+        let server = tokio::spawn(async move {
+            server(server_conn, &host, async move |_: &str, key: &[u8; 32]| {
+                if *key == user_pub { Ok(()) } else { Err(None) }
+            })
+            .await
+        });
+        let mut c = client(client_conn, "alice", &user, |k| if *k == host_pub { Ok(()) } else { Err("x".into()) })
+            .await
+            .unwrap();
+        let (mut s, _) = server.await.unwrap().unwrap();
+        for i in 0..100u64 {
+            let data = vec![i as u8; 16 * 1024];
+            c.send_data(&Data::Bytes { stream: DataStream::Stdin, offset: i, data: data.clone() }).await.unwrap();
+            c.send_ctrl(&Ctrl::Ping).await.unwrap();
+            assert!(matches!(s.recv().await.unwrap(), Msg::Data(Data::Bytes { data: d, .. }) if d == data));
+            assert!(matches!(s.recv().await.unwrap(), Msg::Ctrl(Ctrl::Ping)));
+        }
+        // Closing delivers what is queued, then the other side sees the end.
+        s.send_ctrl(&Ctrl::Pong).await.unwrap();
+        s.close();
+        assert!(matches!(c.recv().await.unwrap(), Msg::Ctrl(Ctrl::Pong)));
+        assert!(c.recv().await.is_err());
+    }
+
     #[tokio::test]
     async fn unknown_key_is_rejected() {
         let (client, server, _) = pair(false, true).await;
