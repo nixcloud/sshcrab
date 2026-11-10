@@ -16,8 +16,80 @@ The design and the security analysis are in [SPECIFICATION.md](SPECIFICATION.md)
 | `sshcrab-dht-node` | optional, a public host | a DHT bootstrap node (such as bootstrap.nixcloud.io) |
 
 > Status: young software (see SPECIFICATION.md §12 and §13.8). Do not make it the only way into a machine yet.
-> **P2P status:** works between distinct addresses in the host tests (hole punching included); not yet verified across
-> real NATs. Treat it as experimental, and mind the security notes before enabling it.
+> **P2P status:** works in the host tests and through a real NAT (Starlink, a home network); no relay yet for
+> symmetric NATs. Treat it as experimental, and mind the security notes before enabling it.
+
+## How it works
+
+### Sessions outlive connections
+
+A session (a shell or a command) belongs to `sshcrabd`, not to a connection. The daemon keeps it running when the
+client goes away, until it ends or has been unattached for `DisconnectedTimeout` (24 h by default). Sessions live in
+the daemon's memory only, so a daemon restart ends them.
+
+- **Byte offsets on both directions.** Every chunk of input and output carries its offset in the stream and is
+  acknowledged by the other side at the application level. After a reconnect each side resends from where the
+  other acknowledged, so nothing is lost or duplicated, whichever transport the old and new connection used.
+- **Output buffer on the server.** Unacknowledged output waits in a per-session buffer. A command blocks when it is
+  full (no data loss); an interactive shell drops the oldest output and the client is told how much.
+- **Resuming** (`sshcrab -R`): the client picks a session and continues it; one that is attached elsewhere can be
+  taken over. A shell gets its last 64 KiB of output replayed, a full-screen program (htop, vim) is made to
+  repaint at the new window size, and the terminal modes it had set (alternate screen, mouse, …) are restored.
+- **Liveness.** Both sides ping every 5 s over the encrypted channel; a connection silent for 15 s is dead. The
+  session survives that, and an interactive client reconnects on its own.
+
+### Two ways to reach a server
+
+```
+direct:   sshcrab ── SCTP over UDP (port 22 by default) ─────────────────────────────────► sshcrabd (root)
+
+P2P:      sshcrab ── DHT lookup + hole punch ──► sshcrabd-p2p ── socketpair (fd passing) ──► sshcrabd (root)
+          our protocol inside peeroxide's        unprivileged, sandboxed;      over /run/sshcrab/p2p.sock
+          encrypted stream (UDX over UDP)        relays, never decrypts
+```
+
+- **Direct:** the server's UDP port must be reachable.
+- **P2P:** the server announces itself in a DHT (HyperDHT, through [peeroxide](https://crates.io/crates/peeroxide))
+  under a key derived from its host key; its address is that key, `<52 characters>.p2p`. The client looks the
+  address up, both sides punch a hole through their NATs, and the connection is direct, without any port forward
+  or open firewall. All P2P code runs in the separate `sshcrabd-p2p` helper; the root daemon never links it.
+
+### Protocol layers
+
+```
+              shell, sessions, Ping/Pong
+                        │
+   SecureConn: Noise_NN + Ed25519 (host key, user key)
+                        │
+          ┌─────────────┴─────────────┐
+     direct path                  P2P path
+          │                         │
+         SCTP              SecretStream (peeroxide)
+          │                         │
+         UDP                  UDX over UDP
+```
+
+Our own encryption layer (`SecureConn`) is the same on both paths: host and user authentication, the host-key check
+and the session protocol do not depend on the transport below.
+
+### Protocol decisions
+
+| Decision | Why | Details |
+|---|---|---|
+| **SCTP over UDP** for direct connections, in user space (`sctp-proto`) | Reliable, ordered *message* streams; control and data travel on two separate streams, so lost output does not delay control messages. UDP does not clash with OpenSSH on TCP port 22. QUIC/TLS were considered and rejected. | SPEC §5 |
+| **Own keepalive**, retransmission timeout 0.5–4 s | `sctp-proto` never sends heartbeats and never gives up on an association; an authenticated ping also cannot be spoofed. | SPEC §5 |
+| **Noise_NN + Ed25519 signatures** over the handshake hash | A standard key agreement instead of an ad-hoc one. The server proves its host key first, so the client never reveals user name or key to an unverified server. New keys on every reconnect (forward secrecy across reconnects). | SPEC §6.1–6.2 |
+| **Host keys pinned on first use** (TOFU), also for `.p2p` | Like ssh's `known_hosts`. A `.p2p` address does not replace this check: whoever holds the P2P key (for example after taking over the helper) could present a host key of their own. | SPEC §13.3 |
+| **Reliability at the application level too** (offsets and acks) | Transport reliability ends with the connection; sessions must survive reconnects and switches between transports. | SPEC §4.3 |
+| **Compression** of server output only, after authentication, per message (pure-Rust `ruzstd`) | No decompressor reachable before login; keystrokes (passwords) are never compressed; no shared context leaking between messages. | SPEC §6.6 |
+| **P2P: no SCTP on top of UDX** | Two reliable layers stacked on each other both retransmit and fight each other ("TCP over TCP"). UDX provides retransmission, ordering and congestion control; our messages travel as `stream id ‖ message` frames on one UDX stream. | SPEC §13.1 |
+| **P2P: our encryption inside peeroxide's** | peeroxide's own layer is what lets only the holder of the P2P key answer at an address. Ours keeps the host key authenticated end to end, so the helper and DHT nodes never see plaintext. Costs only CPU. | SPEC §13.1, §13.3 |
+| **P2P in a separate, unprivileged helper** | The DHT and hole-punching code (young, unaudited) handles internet traffic; it runs sandboxed with no access to the host and hands each connection to `sshcrabd` as a file descriptor. | SPEC §13.4–13.5 |
+| **libudx patched** (`vendor/libudx`) | Upstream 1.7.4 waited a full round trip per write and per flush: about 200 ms per keystroke at a 40 ms ping. Now one round trip, like ssh. | `vendor/libudx/SSHCRAB-PATCH.md` |
+
+Trade-offs of the P2P path compared with direct SCTP: control and data share one ordered stream (a lost packet
+delays both), and retransmissions follow libudx's timer (minimum 1 s) instead of ours (0.5 s). Measure with
+`sshcrab --ping`.
 
 ## 1. Your key (client)
 
@@ -89,6 +161,7 @@ sshcrab alice@kxgpyjz9wb5o…ruwyo.p2p              # interactive shell
 sshcrab alice@kxgpyjz9wb5o…ruwyo.p2p 'uptime'     # one command
 sshcrab -R alice@kxgpyjz9wb5o…ruwyo.p2p           # pick a session to resume
 sshcrab -L alice@…  /  sshcrab -C alice@…         # list / detach or remove sessions
+sshcrab --ping alice@…                            # round trips at typing pace (min/median/p99/max)
 sshcrab alice@server.example.org                  # directly over UDP, if openFirewall is set
 ```
 

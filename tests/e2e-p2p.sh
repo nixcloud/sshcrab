@@ -72,6 +72,9 @@ check "2 MB stdin over P2P arrives intact" "[ '$got' = '$want' ]"
 got=$(c "$ADDR" "export PATH=$PATH; cat '$T/blob'" </dev/null | sha256sum | cut -d' ' -f1)
 check "2 MB stdout over P2P arrives intact" "[ '$got' = '$want' ]"
 
+out=$(c --ping --ping-count 5 --ping-interval 20 "$ADDR" </dev/null 2>&1); code=$?
+check "--ping measures round trips over P2P" "[ $code = 0 ] && grep -q '(P2P)' <<<\"\$out\" && grep -q '^--- 5 pings' <<<\"\$out\""
+
 out=$(printf 'export PATH=%s; tty; exit 5\n' "$PATH" | TERM=xterm-256color c "$ADDR" 2>&1); code=$?
 check "interactive session over P2P runs on a PTY" "grep -q /dev/pts/ <<<\"\$out\" && [ $code = 5 ]"
 

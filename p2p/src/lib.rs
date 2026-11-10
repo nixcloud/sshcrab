@@ -7,7 +7,7 @@
 //! peeroxide stream, one stream message per `stream id ‖ message`
 //! ([`sshcrab_proto::p2p::body`]).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use libudx::{UdxAsyncStream, UdxRuntime};
@@ -99,10 +99,21 @@ pub async fn announce(seed: &[u8; 32], bootstrap: &[String], max_peers: usize) -
     Ok(Server { handle, connections, public_key, _task: task })
 }
 
+/// Where [`connect`] is, for a progress display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// Contacting the bootstrap nodes and filling the routing table.
+    JoiningDht,
+    /// Looking up the server's record, then the handshake (relayed through
+    /// DHT nodes) and, behind NAT, hole punching.
+    FindingServer,
+}
+
 /// Connect to the sshcrabd announced under `remote` (its P2P key). The
 /// returned [`Conn`] carries our protocol; a throwaway DHT node and key pair
 /// live as long as it does, so nothing about the user ends up in the DHT.
-pub async fn connect(bootstrap: &[String], remote: [u8; 32]) -> Result<Conn, P2pError> {
+/// `progress` is called as each [`Stage`] begins.
+pub async fn connect(bootstrap: &[String], remote: [u8; 32], progress: impl Fn(Stage)) -> Result<Conn, P2pError> {
     // Through the swarm, like the server: its socket handling (which socket a
     // firewalled node is reachable on, hole punching) is the tested path. The
     // lower-level `HyperDhtHandle::connect` failed between separate hosts.
@@ -111,12 +122,16 @@ pub async fn connect(bootstrap: &[String], remote: [u8; 32]) -> Result<Conn, P2p
     cfg.dht = dht_config(bootstrap);
     apply_test_env(&mut cfg);
     cfg.max_peers = 4;
+    let start = Instant::now();
+    progress(Stage::JoiningDht);
     let (task, handle, mut connections) = peeroxide::spawn(cfg).await?;
     let topic = peeroxide::discovery_key(&remote);
     let result = async {
         if handle.dht().table_size().await.unwrap_or(0) == 0 {
             return Err(P2pError::NoNodes(bootstrap.join(", ")));
         }
+        log::debug!("joined the DHT in {:?}", start.elapsed());
+        progress(Stage::FindingServer);
         let mut opts = peeroxide::JoinOpts::default();
         opts.server = false;
         opts.client = true;
@@ -139,6 +154,7 @@ pub async fn connect(bootstrap: &[String], remote: [u8; 32]) -> Result<Conn, P2p
             return Err(e);
         }
     };
+    log::debug!("connected to {:?} after {:?}", peer.peer.remote_addr, start.elapsed());
     // One connection is all we want; no further dialling.
     let _ = handle.leave(topic).await;
     let (conn, ends) = Conn::pipe(Remote::P2p(peer.peer.remote_addr));

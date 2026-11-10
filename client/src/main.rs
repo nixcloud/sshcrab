@@ -3,6 +3,7 @@
 mod attach;
 mod connect;
 mod local;
+mod ping;
 mod term;
 mod ui;
 
@@ -32,6 +33,16 @@ struct Args {
     /// Control mode: detach or remove sessions.
     #[arg(short = 'C', long = "control")]
     control: bool,
+    /// Measure round trips over the connection (the path keystrokes and their
+    /// echo take) instead of opening a shell.
+    #[arg(long)]
+    ping: bool,
+    /// Pings to send with --ping; 0 = until Ctrl+C.
+    #[arg(long, default_value_t = 100, value_name = "N", requires = "ping")]
+    ping_count: u32,
+    /// Milliseconds between pings with --ping (about typing pace by default).
+    #[arg(long, default_value_t = 100, value_name = "MS", requires = "ping", value_parser = clap::value_parser!(u64).range(1..))]
+    ping_interval: u64,
     /// Trust an unknown host key without asking (never overrides a mismatch).
     #[arg(long)]
     accept_new: bool,
@@ -85,16 +96,16 @@ async fn run(args: Args) -> i32 {
     if args.new && resume.is_some() {
         return fail("-N/--new and -R/--resume cannot be combined", 2);
     }
-    let modes = [args.list, args.control, args.new || resume.is_some()].iter().filter(|m| **m).count();
+    let modes = [args.list, args.control, args.new || resume.is_some(), args.ping].iter().filter(|m| **m).count();
     if modes > 1 {
-        return fail("-L, -C and -N/-R cannot be combined", 2);
+        return fail("-L, -C, -N/-R and --ping cannot be combined", 2);
     }
     let Some(destination) = rest.first().cloned() else {
         return fail("missing [user@]host", 2);
     };
     let command = (rest.len() > 1).then(|| rest[1..].join(" "));
-    if command.is_some() && (resume.is_some() || args.list || args.control) {
-        return fail("a remote command cannot be combined with -R, -L or -C", 2);
+    if command.is_some() && (resume.is_some() || args.list || args.control || args.ping) {
+        return fail("a remote command cannot be combined with -R, -L, -C or --ping", 2);
     }
     let (user, host) = match destination.rsplit_once('@') {
         Some((u, h)) => (u.to_string(), h.to_string()),
@@ -114,6 +125,7 @@ async fn run(args: Args) -> i32 {
         Ok(c) => c,
         Err(e) => return fail(e, 255),
     };
+    let start = std::time::Instant::now();
     let mut sc = match connector.connect(true).await {
         Ok(sc) => sc,
         Err(e) => return fail(e.message(), 255),
@@ -124,6 +136,10 @@ async fn run(args: Args) -> i32 {
     }
     if args.control {
         return control(&mut sc).await;
+    }
+    if args.ping {
+        let interval = std::time::Duration::from_millis(args.ping_interval);
+        return ping::run(&mut sc, start.elapsed(), args.ping_count, interval).await;
     }
 
     let mut resume_command = format!("sshcrab -R {{id}}");

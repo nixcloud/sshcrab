@@ -58,7 +58,7 @@ async fn run() {
         tokio::time::sleep(Duration::from_secs(1)).await;
     });
 
-    let conn = sshcrab_p2p::connect(&bootstrap, server_pub_key(&seed)).await.unwrap();
+    let conn = sshcrab_p2p::connect(&bootstrap, server_pub_key(&seed), |_| {}).await.unwrap();
     let mut sc = handshake::client(conn, "alice", &user, |k| if *k == host_pub { Ok(()) } else { Err("x".into()) })
         .await
         .unwrap();

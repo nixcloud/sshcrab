@@ -48,6 +48,9 @@ check "5 MB stdin arrives intact" "[ '$got' = '$want' ]"
 got=$(c 127.0.0.1 "$P cat '$T/blob'" </dev/null | sha256sum | cut -d' ' -f1)
 check "5 MB stdout arrives intact" "[ '$got' = '$want' ]"
 
+out=$(c --ping --ping-count 5 --ping-interval 20 127.0.0.1 </dev/null 2>&1); code=$?
+check "--ping measures round trips over UDP" "[ $code = 0 ] && grep -q '(direct UDP)' <<<\"\$out\" && grep -q '^--- 5 pings' <<<\"\$out\""
+
 out=$(printf '%s tty; exit 5\n' "$P" | TERM=xterm-256color c 127.0.0.1 2>&1); code=$?
 check "interactive session runs on a PTY" "grep -q /dev/pts/ <<<\"\$out\" && [ $code = 5 ]"
 

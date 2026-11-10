@@ -4,12 +4,13 @@ use std::cell::Cell;
 use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sshcrab_proto::channel::SecureConn;
 use sshcrab_proto::handshake::{self, HandshakeError};
 use sshcrab_proto::hostkeys::{self, Lookup};
 use sshcrab_proto::keys::{self, Identity};
+use sshcrab_p2p::Stage;
 use sshcrab_proto::{p2p, transport};
 
 use crate::{local, ui};
@@ -38,6 +39,8 @@ impl ConnectError {
 
 /// DHT lookup plus hole punching (up to about 40 s, spec §13).
 const P2P_TIMEOUT: Duration = Duration::from_secs(45);
+/// A P2P connection taking longer than this gets a status line.
+const STATUS_AFTER: Duration = Duration::from_millis(300);
 
 pub struct Connector {
     pub target: Target,
@@ -79,16 +82,53 @@ impl Connector {
         addrs.next().ok_or_else(|| ConnectError::Transient(format!("{}: no address", self.target.host)))
     }
 
+    /// Through the DHT: lookup and hole punching can take a while (spec §13),
+    /// so with `show` a status line on stderr says what it waits for; it is
+    /// removed once connected or failed.
+    async fn connect_p2p(&self, key: [u8; 32], show: bool) -> Result<transport::Conn, ConnectError> {
+        let host = &self.target.host;
+        let (stage_tx, stage) = tokio::sync::watch::channel(Stage::JoiningDht);
+        let connect = tokio::time::timeout(
+            P2P_TIMEOUT,
+            sshcrab_p2p::connect(&self.bootstrap, key, |s| {
+                let _ = stage_tx.send(s);
+            }),
+        );
+        tokio::pin!(connect);
+        let start = Instant::now();
+        let mut tick = tokio::time::interval(Duration::from_millis(100));
+        let mut shown = false;
+        let result = loop {
+            tokio::select! {
+                r = &mut connect => break r,
+                _ = tick.tick(), if show => {
+                    // Quiet for fast connections, so nothing flickers.
+                    if start.elapsed() < STATUS_AFTER {
+                        continue;
+                    }
+                    let what = match *stage.borrow() {
+                        Stage::JoiningDht => "joining the DHT",
+                        Stage::FindingServer => "finding the server and connecting",
+                    };
+                    eprint!("\r\x1b[Ksshcrab: {what}… {:.1}s", start.elapsed().as_secs_f32());
+                    shown = true;
+                }
+            }
+        };
+        if shown {
+            eprint!("\r\x1b[K");
+        }
+        result
+            .map_err(|_| ConnectError::Transient(format!("{host}: no connection through the DHT")))?
+            .map_err(|e| ConnectError::Transient(format!("{host}: {e}")))
+    }
+
     /// Connect and authenticate. An unknown host key is confirmed (or accepted
     /// with `--accept-new`), stored, and the connection retried.
     pub async fn connect(&self, interactive_prompts: bool) -> Result<SecureConn, ConnectError> {
         for _ in 0..2 {
             let conn = match p2p::parse_address(&self.target.host) {
-                // Lookup and hole punching can take a while (spec §13).
-                Some(key) => tokio::time::timeout(P2P_TIMEOUT, sshcrab_p2p::connect(&self.bootstrap, key))
-                    .await
-                    .map_err(|_| ConnectError::Transient(format!("{}: no connection through the DHT", self.target.host)))?
-                    .map_err(|e| ConnectError::Transient(format!("{}: {e}", self.target.host)))?,
+                Some(key) => self.connect_p2p(key, interactive_prompts && std::io::stderr().is_terminal()).await?,
                 None => {
                     let addr = self.resolve().await?;
                     tokio::time::timeout(Duration::from_secs(10), transport::connect(addr))
