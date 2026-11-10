@@ -101,11 +101,67 @@ cat ~/.sshcrab/id_ed25519.pub      # goes into the server configuration below
 
 ## 2. A NixOS server
 
-Start from the template, or add the module to your existing flake:
+sshcrab is distributed as a flake, but your server does not have to be one: a classic `configuration.nix` imports
+the NixOS module straight from the flake and keeps `nixos-rebuild switch` as it is.
+
+```nix
+# /etc/nixos/configuration.nix
+{ config, pkgs, ... }:
+let
+  # Pin a commit: without one, every rebuild may pick up a newer sshcrab.
+  sshcrab = builtins.getFlake "github:nixcloud/nixcloud.sshcrab/<commit>";
+in
+{
+  imports = [
+    ./hardware-configuration.nix
+    sshcrab.nixosModules.default          # adds services.sshcrab
+  ];
+
+  # builtins.getFlake needs the flakes feature (your configuration stays a non-flake one).
+  nix.settings.experimental-features = [ "nix-command" "flakes" ];
+
+  services.sshcrab = {
+    enable = true;
+    authorizedKeys.alice = [ "ssh-ed25519 AAAAC3Nza... alice@laptop" ];
+    p2p.enable = true;        # reachable through the DHT, also behind NAT
+    # openFirewall = true;    # also reachable directly on UDP port 22
+  };
+}
+```
 
 ```sh
-nix flake init -t github:nixcloud/nixcloud.sshcrab#server
+# The first time, before the setting above is active:
+nixos-rebuild switch --option experimental-features 'nix-command flakes'
+# From then on, as usual:
+nixos-rebuild switch
 ```
+
+Updating sshcrab means changing `<commit>`. sshcrab is built with the nixpkgs pinned in its own `flake.lock`, not
+your system's; only the module's systemd units, users and settings become part of your system. The build files are
+generated during evaluation (import from derivation, allowed by default), so the first evaluation takes a while.
+
+**Without the flakes feature at all:** load the flake through
+[flake-compat](https://github.com/edolstra/flake-compat), which also follows sshcrab's `flake.lock`:
+
+```nix
+let
+  sshcrab = (import (fetchTarball {
+    url = "https://github.com/edolstra/flake-compat/archive/<rev>.tar.gz";
+    sha256 = "<hash>";
+  }) {
+    src = fetchTarball {
+      url = "https://github.com/nixcloud/nixcloud.sshcrab/archive/<commit>.tar.gz";
+      sha256 = "<hash>";
+    };
+  }).defaultNix;
+in
+{
+  imports = [ sshcrab.nixosModules.default ];
+  # services.sshcrab = { ... } as above
+}
+```
+
+**If your server is a flake already:** add the input and the module, or start from the template:
 
 ```nix
 # flake.nix
@@ -113,18 +169,12 @@ inputs.sshcrab.url = "github:nixcloud/nixcloud.sshcrab";
 # nixosSystem { modules = [ sshcrab.nixosModules.default ./configuration.nix ]; }
 ```
 
-```nix
-# configuration.nix
-services.sshcrab = {
-  enable = true;
-  authorizedKeys.alice = [ "ssh-ed25519 AAAAC3Nza... alice@laptop" ];
-  p2p.enable = true;        # reachable through the DHT, also behind NAT
-  # openFirewall = true;    # also reachable directly on UDP port 22
-};
+```sh
+nix flake init -t github:nixcloud/nixcloud.sshcrab#server
+nixos-rebuild switch --flake .#myserver     # --target-host root@server for a remote machine
 ```
 
-Deploy (`nixos-rebuild switch --flake .#myserver`, with `--target-host root@server` for a remote machine), then
-get the address:
+Once deployed, get the address:
 
 ```sh
 sshcrab-p2p-address         # on the server, e.g. kxgpyjz9wb5o…ruwyo.p2p
