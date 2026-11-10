@@ -23,6 +23,7 @@ tokio = { version = "1", features = ["full"] }
 nix = { version = "0.31", features = ["user", "process", "signal", "term", "fs", "ioctl", "pthread", "resource", "hostname", "socket", "uio"] }
 clap = { version = "4", features = ["derive"] }
 cliclack = "0.5"
+vt100 = "0.18"
 uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = "1"
 toml = "1"

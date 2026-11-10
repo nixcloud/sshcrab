@@ -41,6 +41,9 @@ pub struct Session {
     col: usize,
     /// Terminal modes the session's output switched on, to undo when leaving.
     modes: Modes,
+    /// What the session's screen shows (interactive only), the grey backdrop
+    /// of the reconnect dialog.
+    screen: Option<vt100::Parser>,
 }
 
 impl Session {
@@ -54,6 +57,7 @@ impl Session {
             stdin_eof: false,
             col: 0,
             modes: Modes::default(),
+            screen: if interactive { term::window_size().map(|(cols, rows)| screen_model(cols, rows)) } else { None },
         }
     }
 
@@ -64,6 +68,9 @@ impl Session {
             let _ = out.write_all(seq);
             let _ = out.flush();
             self.modes.feed(seq);
+            if let Some(s) = &mut self.screen {
+                s.process(seq);
+            }
         }
     }
 
@@ -76,6 +83,18 @@ impl Session {
             let _ = out.write_all(&seq);
             let _ = out.flush();
         }
+    }
+
+    /// Follow the window size, as the remote PTY does.
+    fn resize_screen(&mut self) {
+        if let (Some(s), Some((cols, rows))) = (&mut self.screen, term::window_size()) {
+            s.set_size(nonzero(rows), nonzero(cols));
+        }
+    }
+
+    /// The session's screen as the model has it, for the reconnect dialog.
+    fn screen(&self) -> Option<vt100::Screen> {
+        self.screen.as_ref().map(|s| s.screen().clone())
     }
 
     fn track_column(&mut self, data: &[u8]) {
@@ -225,6 +244,7 @@ impl Runner<'_> {
         }
         if self.session.interactive {
             // Also makes full-screen programs redraw after a resume.
+            self.session.resize_screen();
             if let Some((cols, rows)) = term::window_size() {
                 if sc.send_ctrl(&Ctrl::WindowSize { cols, rows }).await.is_err() {
                     return End::Lost;
@@ -258,6 +278,9 @@ impl Runner<'_> {
                             let _ = out.write_all(new);
                             if self.session.interactive {
                                 self.session.modes.feed(new);
+                                if let Some(s) = &mut self.session.screen {
+                                    s.process(new);
+                                }
                             }
                             let _ = out.flush();
                         } else {
@@ -306,6 +329,7 @@ impl Runner<'_> {
                     }
                 },
                 _ = winch.recv() => {
+                    self.session.resize_screen();
                     if let Some((cols, rows)) = term::window_size() {
                         if sc.send_ctrl(&Ctrl::WindowSize { cols, rows }).await.is_err() {
                             return End::Lost;
@@ -333,7 +357,9 @@ impl Runner<'_> {
     async fn reconnect(&mut self) -> Result<(SecureConn, Offsets), Outcome> {
         let since = Instant::now();
         let target = &self.connector.target;
-        let mut dialog = Dialog::new(format!("connection to {}@{} lost", target.user, target.host), self.session.col);
+        let title = format!("connection to {}@{} lost", target.user, target.host);
+        let mut dialog = Dialog::new(title, self.session.col, self.session.screen());
+        let mut winch = signal(SignalKind::window_change()).expect("SIGWINCH handler");
         let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         for attempt in 1usize.. {
@@ -348,6 +374,10 @@ impl Runner<'_> {
                         dialog.update(&format!("reconnecting… (elapsed {}s, next in {left}s)", since.elapsed().as_secs()));
                     }
                     _ = sigint.recv() => return Err(self.abort(dialog, since)),
+                    _ = winch.recv() => {
+                        self.session.resize_screen();
+                        dialog.resize(self.session.screen());
+                    }
                     input = self.stdin.recv(), if !self.session.stdin_eof => if self.keep_input(input) {
                         return Err(self.abort(dialog, since));
                     },
@@ -368,6 +398,10 @@ impl Runner<'_> {
                         *stage.borrow(),
                     )),
                     _ = sigint.recv() => return Err(self.abort(dialog, since)),
+                    _ = winch.recv() => {
+                        self.session.resize_screen();
+                        dialog.resize(self.session.screen());
+                    }
                     input = self.stdin.recv(), if !self.session.stdin_eof => if self.keep_input(input) {
                         return Err(self.abort(dialog, since));
                     },
@@ -463,4 +497,12 @@ async fn try_resume(connector: &Connector, attach: Attach, report: &Report) -> R
             _ => return Err(Failed::Retry),
         }
     }
+}
+
+fn screen_model(cols: u16, rows: u16) -> vt100::Parser {
+    vt100::Parser::new(nonzero(rows), nonzero(cols), 0)
+}
+
+fn nonzero(n: u16) -> std::num::NonZeroU16 {
+    std::num::NonZeroU16::new(n).unwrap_or(std::num::NonZeroU16::MIN)
 }

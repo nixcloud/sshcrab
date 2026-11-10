@@ -9,6 +9,7 @@ sshcrab-proto.workspace = true
 tokio.workspace = true
 clap.workspace = true
 cliclack.workspace = true
+vt100.workspace = true
 nix.workspace = true
 uuid.workspace = true
 anyhow.workspace = true

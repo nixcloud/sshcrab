@@ -194,6 +194,11 @@ Full `cliclack` workflow:
   during an attempt (joining the DHT, finding the server, authenticating, resuming). Drawn by hand: cliclack's prompts
   read the keyboard themselves and its spinner draws from another thread. Completely removed on success (cursor back
   to where the output left it). Without a terminal on stderr: one line when the connection is lost, one on success.
+- Interactive sessions: the client keeps a model of the screen (`vt100` crate, fed with all output). While
+  disconnected, the screen is shown in barely visible grey behind the dialog (context, but clearly not live). A shell's
+  screen is greyed on the alternate screen, so the terminal itself restores the real one on reconnect and a wrong model
+  can only spoil the grey copy. A full-screen program is already on the alternate screen: the copy is drawn over it and
+  the model's contents put back on reconnect, before the program repaints (§4.3).
 - A single Ctrl+C while disconnected, also in the middle of an attempt, does **not** alter local or remote sessions; it
   shows the dialog as cancelled with a resume command that replicates the original invocation (UUID + host + port and
   other original flags, not the remote command; shell-quoted) and exits. The local `sessions/<PID>/session` file is
