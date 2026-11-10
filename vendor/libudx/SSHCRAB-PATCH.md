@@ -26,7 +26,9 @@ close to zero, so the problem cannot be seen there.
   (backpressure; the congestion controller paces the actual sending as before).
 - `poll_flush` no longer waits for ACKs (TCP semantics: data handed to the stream is "flushed"); it still reports a
   failed earlier write.
-- `poll_shutdown` queues FIN behind all data and resolves once everything, FIN included, is acknowledged.
+- `poll_shutdown` queues FIN behind all data and resolves once everything, FIN included, is acknowledged. (The
+  FIN counts 0 bytes, so it waits for the queue of ACKs to be empty, not for a byte count; otherwise a process
+  exiting right after `shutdown()` never sent its FIN.)
 
 `src/native/stream.rs`: `StreamInner::coalesce_write` appends a small write to the newest queued, not yet sent
 DATA packet if it fits (like TCP's send buffer), so writes waiting behind a full congestion window leave as a
@@ -43,6 +45,9 @@ Wire format and the `UdxStream` message API are unchanged.
   |---|---|---|
   | one message there and back (echo) | 132 ms | 45 ms |
   | 50 messages there and back | 4.4 s | 56 ms |
+
+  `shutdown_waits_for_the_end_to_arrive` in the same file checks that `shutdown()` takes a round trip and the peer
+  sees EOF.
 
 - libudx's own test suite passes (lifecycle, errors, loss/delay/reorder simulation, MTU probing, throughput,
   relay). The Node.js interop tests (`stream_interop`, `udx_interop`, `wire_compat`) need scripts not shipped in

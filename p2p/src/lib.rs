@@ -112,7 +112,8 @@ pub enum Stage {
 /// Connect to the sshcrabd announced under `remote` (its P2P key). The
 /// returned [`Conn`] carries our protocol; a throwaway DHT node and key pair
 /// live as long as it does, so nothing about the user ends up in the DHT.
-/// `progress` is called as each [`Stage`] begins.
+/// `progress` is called as each [`Stage`] begins. Dropping the future (a
+/// timeout, Ctrl+C) shuts that DHT node down too.
 pub async fn connect(bootstrap: &[String], remote: [u8; 32], progress: impl Fn(Stage)) -> Result<Conn, P2pError> {
     // Through the swarm, like the server: its socket handling (which socket a
     // firewalled node is reachable on, hole punching) is the tested path. The
@@ -125,38 +126,28 @@ pub async fn connect(bootstrap: &[String], remote: [u8; 32], progress: impl Fn(S
     let start = Instant::now();
     progress(Stage::JoiningDht);
     let (task, handle, mut connections) = peeroxide::spawn(cfg).await?;
+    let swarm = Swarm { handle, task };
     let topic = peeroxide::discovery_key(&remote);
-    let result = async {
-        if handle.dht().table_size().await.unwrap_or(0) == 0 {
-            return Err(P2pError::NoNodes(bootstrap.join(", ")));
-        }
-        log::debug!("joined the DHT in {:?}", start.elapsed());
-        progress(Stage::FindingServer);
-        let mut opts = peeroxide::JoinOpts::default();
-        opts.server = false;
-        opts.client = true;
-        handle.join(topic, opts).await?;
-        // Anyone may announce on the topic; only the holder of `remote` counts
-        // (Noise IK authenticated the key the swarm reports).
-        loop {
-            let c = connections.recv().await.ok_or(P2pError::WrongPeer)?;
-            if c.remote_public_key() == &remote {
-                return Ok(c);
-            }
-        }
+    if swarm.handle.dht().table_size().await.unwrap_or(0) == 0 {
+        return Err(P2pError::NoNodes(bootstrap.join(", ")));
     }
-    .await;
-    let peer = match result {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = handle.destroy().await;
-            task.abort();
-            return Err(e);
+    log::debug!("joined the DHT in {:?}", start.elapsed());
+    progress(Stage::FindingServer);
+    let mut opts = peeroxide::JoinOpts::default();
+    opts.server = false;
+    opts.client = true;
+    swarm.handle.join(topic, opts).await?;
+    // Anyone may announce on the topic; only the holder of `remote` counts
+    // (Noise IK authenticated the key the swarm reports).
+    let peer = loop {
+        let c = connections.recv().await.ok_or(P2pError::WrongPeer)?;
+        if c.remote_public_key() == &remote {
+            break c;
         }
     };
     log::debug!("connected to {:?} after {:?}", peer.peer.remote_addr, start.elapsed());
     // One connection is all we want; no further dialling.
-    let _ = handle.leave(topic).await;
+    let _ = swarm.handle.leave(topic).await;
     let (conn, ends) = Conn::pipe(Remote::P2p(peer.peer.remote_addr));
     tokio::spawn(async move {
         let peer = peer;
@@ -164,10 +155,32 @@ pub async fn connect(bootstrap: &[String], remote: [u8; 32], progress: impl Fn(S
         bridge_secret_stream(stream, ends).await;
         // The rest of the connection (socket, swarm) stays alive until here.
         drop(peer.peer.socket);
-        let _ = handle.destroy().await;
-        task.abort();
+        drop(swarm);
     });
     Ok(conn)
+}
+
+/// A client's swarm, destroyed when dropped.
+struct Swarm {
+    handle: peeroxide::SwarmHandle,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Swarm {
+    fn drop(&mut self) {
+        let handle = self.handle.clone();
+        let task = self.task.abort_handle();
+        // Destroying needs the swarm task; abort it afterwards in any case.
+        // Outside a runtime (process exit) there is nothing left to clean up.
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(2), handle.destroy()).await;
+                task.abort();
+            });
+        } else {
+            task.abort();
+        }
+    }
 }
 
 /// Carry a pipe [`Conn`] over a peeroxide stream until either side ends.
@@ -216,8 +229,10 @@ async fn bridge_secret_stream(stream: SecretStream<UdxAsyncStream>, ends: PipeEn
 }
 
 /// Relay between a peeroxide stream and a framed byte stream (the helper's
-/// socketpair to sshcrabd) without looking inside the messages.
-pub async fn relay<S>(stream: SecretStream<UdxAsyncStream>, local: S)
+/// socketpair to sshcrabd) without looking inside the messages. Once `stop`
+/// becomes true (the helper shuts down), the stream is ended properly, so the
+/// client starts reconnecting at once instead of after its idle timeout.
+pub async fn relay<S>(stream: SecretStream<UdxAsyncStream>, local: S, mut stop: tokio::sync::watch::Receiver<bool>)
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
@@ -234,9 +249,17 @@ where
     };
     let down = async move {
         // sshcrabd → peer
-        while let Ok(Some(msg)) = read_frame(&mut lr).await {
-            if sw.write(&msg).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                msg = read_frame(&mut lr) => match msg {
+                    Ok(Some(msg)) => {
+                        if sw.write(&msg).await.is_err() {
+                            break;
+                        }
+                    }
+                    _ => break,
+                },
+                _ = async { let _ = stop.wait_for(|s| *s).await; } => break,
             }
         }
         let _ = tokio::time::timeout(Duration::from_secs(2), sw.shutdown()).await;

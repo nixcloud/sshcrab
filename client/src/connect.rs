@@ -42,6 +42,16 @@ const P2P_TIMEOUT: Duration = Duration::from_secs(45);
 /// A P2P connection taking longer than this gets a status line.
 const STATUS_AFTER: Duration = Duration::from_millis(300);
 
+/// What a connection attempt is doing right now, for a progress display.
+pub type Report = tokio::sync::watch::Sender<&'static str>;
+
+fn stage_label(stage: Stage) -> &'static str {
+    match stage {
+        Stage::JoiningDht => "joining the DHT",
+        Stage::FindingServer => "finding the server and connecting",
+    }
+}
+
 pub struct Connector {
     pub target: Target,
     identity: Identity,
@@ -84,14 +94,17 @@ impl Connector {
 
     /// Through the DHT: lookup and hole punching can take a while (spec §13),
     /// so with `show` a status line on stderr says what it waits for; it is
-    /// removed once connected or failed.
-    async fn connect_p2p(&self, key: [u8; 32], show: bool) -> Result<transport::Conn, ConnectError> {
+    /// removed once connected or failed. `report` gets the same stages.
+    async fn connect_p2p(&self, key: [u8; 32], show: bool, report: Option<&Report>) -> Result<transport::Conn, ConnectError> {
         let host = &self.target.host;
         let (stage_tx, stage) = tokio::sync::watch::channel(Stage::JoiningDht);
         let connect = tokio::time::timeout(
             P2P_TIMEOUT,
             sshcrab_p2p::connect(&self.bootstrap, key, |s| {
                 let _ = stage_tx.send(s);
+                if let Some(r) = report {
+                    r.send_replace(stage_label(s));
+                }
             }),
         );
         tokio::pin!(connect);
@@ -106,10 +119,7 @@ impl Connector {
                     if start.elapsed() < STATUS_AFTER {
                         continue;
                     }
-                    let what = match *stage.borrow() {
-                        Stage::JoiningDht => "joining the DHT",
-                        Stage::FindingServer => "finding the server and connecting",
-                    };
+                    let what = stage_label(*stage.borrow());
                     eprint!("\r\x1b[Ksshcrab: {what}… {:.1}s", start.elapsed().as_secs_f32());
                     shown = true;
                 }
@@ -126,10 +136,32 @@ impl Connector {
     /// Connect and authenticate. An unknown host key is confirmed (or accepted
     /// with `--accept-new`), stored, and the connection retried.
     pub async fn connect(&self, interactive_prompts: bool) -> Result<SecureConn, ConnectError> {
+        let show = interactive_prompts && std::io::stderr().is_terminal();
+        self.connect_reporting(interactive_prompts, show, None).await
+    }
+
+    /// Connect again after a lost connection: no prompts and no status line;
+    /// what it is doing goes to `report` instead (the reconnect dialog).
+    pub async fn reconnect(&self, report: &Report) -> Result<SecureConn, ConnectError> {
+        self.connect_reporting(false, false, Some(report)).await
+    }
+
+    async fn connect_reporting(
+        &self,
+        interactive_prompts: bool,
+        show: bool,
+        report: Option<&Report>,
+    ) -> Result<SecureConn, ConnectError> {
+        let say = |what| {
+            if let Some(r) = report {
+                r.send_replace(what);
+            }
+        };
         for _ in 0..2 {
             let conn = match p2p::parse_address(&self.target.host) {
-                Some(key) => self.connect_p2p(key, interactive_prompts && std::io::stderr().is_terminal()).await?,
+                Some(key) => self.connect_p2p(key, show, report).await?,
                 None => {
+                    say("connecting");
                     let addr = self.resolve().await?;
                     tokio::time::timeout(Duration::from_secs(10), transport::connect(addr))
                         .await
@@ -137,6 +169,7 @@ impl Connector {
                         .map_err(|e| ConnectError::Transient(format!("{addr}: {e}")))?
                 }
             };
+            say("authenticating");
 
             let contents = std::fs::read_to_string(&self.hostkeys).unwrap_or_default();
             let unknown = Cell::new(None);

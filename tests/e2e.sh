@@ -81,7 +81,7 @@ if [ "${1:-}" != --skip-reconnect ]; then
     wait $CL; code=$?
     check "reconnect after a 20 s outage: exit code" "[ $code = 3 ]"
     check "reconnect after a 20 s outage: output complete, no duplicates" "seq 1 30 | cmp -s - '$T/rc.out'"
-    check "reconnect status line was shown" "grep -q 'reconnecting… (elapsed' '$T/rc.err'"
+    check "reconnect was reported" "grep -q 'lost; reconnecting…' '$T/rc.err' && grep -q 'sshcrab: reconnected' '$T/rc.err'"
 fi
 
 # Last: stopping the daemon tells attached clients instead of leaving them to reconnect.

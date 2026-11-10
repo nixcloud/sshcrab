@@ -118,3 +118,24 @@ async fn run() {
         assert!(b < RTT * 2, "{n} messages take {b:?}, over 2 round trips of {RTT:?}");
     }
 }
+
+/// `shutdown()` returns once the peer acknowledged the end of the stream, so a
+/// process may exit right after it (the helper does) and the peer still learns
+/// the stream ended, instead of waiting for its idle timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_waits_for_the_end_to_arrive() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let rt = UdxRuntime::new().unwrap();
+        let (a, b, _sockets) = pair(&rt).await;
+        let (_ar, mut aw) = a.into_split();
+        let (mut br, _bw) = b.into_split();
+        let start = Instant::now();
+        aw.shutdown().await.unwrap();
+        let took = start.elapsed();
+        assert!(took >= RTT, "shutdown returned after {took:?}, before a round trip of {RTT:?}");
+        assert!(br.read().await.unwrap().is_none(), "the peer sees the end");
+    })
+    .await
+    .expect("timed out");
+}

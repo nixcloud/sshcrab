@@ -142,6 +142,10 @@ struct PipeConn {
     tx: mpsc::Sender<(u16, Bytes)>,
     rx: mpsc::Receiver<(u16, Bytes)>,
     close: watch::Sender<bool>,
+    /// Dead unless a message arrives before this. A deadline, not a timeout
+    /// per `recv()` call: callers select over `recv()` and restart it on every
+    /// keystroke and ping, which would keep resetting a timeout.
+    alive_until: tokio::time::Instant,
 }
 
 /// The bridge's side of a pipe [`Conn`].
@@ -160,7 +164,8 @@ impl Conn {
         let (out_tx, out_rx) = mpsc::channel(RECV_QUEUE);
         let (in_tx, in_rx) = mpsc::channel(RECV_QUEUE);
         let (close, closed) = watch::channel(false);
-        let conn = Conn { inner: Inner::Pipe(PipeConn { remote, tx: out_tx, rx: in_rx, close }) };
+        let alive_until = tokio::time::Instant::now() + IDLE_TIMEOUT;
+        let conn = Conn { inner: Inner::Pipe(PipeConn { remote, tx: out_tx, rx: in_rx, close, alive_until }) };
         (conn, PipeEnds { outgoing: out_rx, incoming: in_tx, closed })
     }
 
@@ -200,7 +205,18 @@ impl Conn {
                 msg
             }
             // The same dead-peer rule as for SCTP: the peer pings every `KEEPALIVE`.
-            Inner::Pipe(p) => tokio::time::timeout(IDLE_TIMEOUT, p.rx.recv()).await.ok().flatten(),
+            Inner::Pipe(p) => match tokio::time::timeout_at(p.alive_until, p.rx.recv()).await {
+                Ok(Some(msg)) => {
+                    p.alive_until = tokio::time::Instant::now() + IDLE_TIMEOUT;
+                    Some(msg)
+                }
+                Ok(None) => None,
+                // Stays dead: the deadline has passed for later calls too.
+                Err(_) => {
+                    debug!("connection {} idle for {IDLE_TIMEOUT:?}; dead", p.remote);
+                    None
+                }
+            },
         }
     }
 
@@ -844,6 +860,35 @@ mod tests {
         println!("client detected dead path after {detected:?}");
         assert!(detected >= IDLE_TIMEOUT && detected < IDLE_TIMEOUT + Duration::from_secs(2));
         let _ = server; // the server side has no keepalive of its own in this test
+    }
+
+    /// A pipe whose peer went silent is dead after `IDLE_TIMEOUT`, even though
+    /// the caller keeps sending pings and restarting `recv()` meanwhile (the
+    /// client's session loop does exactly that).
+    #[tokio::test(start_paused = true)]
+    async fn silent_pipe_is_dead_despite_restarted_recv() {
+        let (mut conn, ends) = Conn::pipe(Remote::P2p(None));
+        let start = tokio::time::Instant::now();
+        let mut ping = tokio::time::interval(KEEPALIVE / 5);
+        loop {
+            tokio::select! {
+                msg = conn.recv() => {
+                    assert!(msg.is_none());
+                    break;
+                }
+                _ = ping.tick() => conn.send(STREAM_CTRL, Bytes::from_static(b"ping")).await.unwrap(),
+            }
+        }
+        assert_eq!(start.elapsed(), IDLE_TIMEOUT);
+        // A message in time keeps it alive.
+        let (mut conn, ends2) = Conn::pipe(Remote::P2p(None));
+        tokio::time::sleep(IDLE_TIMEOUT - Duration::from_secs(1)).await;
+        ends2.incoming.send((STREAM_CTRL, Bytes::from_static(b"pong"))).await.unwrap();
+        assert!(conn.recv().await.is_some());
+        tokio::time::sleep(IDLE_TIMEOUT - Duration::from_secs(1)).await;
+        ends2.incoming.send((STREAM_CTRL, Bytes::from_static(b"pong"))).await.unwrap();
+        assert!(conn.recv().await.is_some());
+        drop(ends);
     }
 
     #[tokio::test]

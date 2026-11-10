@@ -233,6 +233,9 @@ impl AsyncWrite for UdxAsyncStream {
         match self.poll_acks(cx, 0) {
             // Closed under us (as upstream): nothing left to shut down.
             Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::BrokenPipe => Poll::Ready(Ok(())),
+            // The FIN counts 0 bytes, so the byte limit alone does not wait for
+            // it; poll_acks polled the front ack, which wakes us when it lands.
+            Poll::Ready(Ok(())) if !self.pending_acks.is_empty() => Poll::Pending,
             other => other,
         }
     }

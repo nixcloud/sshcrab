@@ -7,7 +7,7 @@ use sshcrab_proto::channel::Msg;
 use sshcrab_proto::handshake;
 use sshcrab_proto::keys::Identity;
 use sshcrab_proto::transport::{Conn, Remote};
-use sshcrab_proto::wire::{Ctrl, Data, DataStream};
+use sshcrab_proto::wire::{Data, DataStream};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn connect_through_a_local_dht() {
@@ -29,13 +29,14 @@ async fn run() {
     let mut server = sshcrab_p2p::announce(&seed, &bootstrap, 8).await.unwrap();
     assert_eq!(server.public_key, sshcrab_proto::p2p::public_key(&seed));
 
+    let (stop_tx, stop) = tokio::sync::watch::channel(false);
     let server_task = tokio::spawn(async move {
         let peer = server.connections.recv().await.expect("a connection");
         // As the helper does: relay to a socketpair, the daemon end becomes a Conn.
         let (helper_end, daemon_end) = sshcrab_proto::seqpacket::stream_pair().unwrap();
         let helper_end = sshcrab_proto::seqpacket::into_unix_stream(helper_end).unwrap();
         let stream = peer.peer.stream;
-        tokio::spawn(sshcrab_p2p::relay(stream, helper_end));
+        tokio::spawn(sshcrab_p2p::relay(stream, helper_end, stop));
         let (conn, ends) = Conn::pipe(Remote::P2p(None));
         tokio::spawn(sshcrab_proto::p2p::bridge(
             sshcrab_proto::seqpacket::into_unix_stream(daemon_end).unwrap(),
@@ -53,9 +54,8 @@ async fn run() {
             }
             _ => panic!("expected data"),
         }
-        assert!(matches!(sc.recv().await.unwrap(), Msg::Ctrl(Ctrl::Close)));
-        sc.close();
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // The daemon side stays up; only the helper goes away (below).
+        while sc.recv().await.is_ok() {}
     });
 
     let conn = sshcrab_p2p::connect(&bootstrap, server_pub_key(&seed), |_| {}).await.unwrap();
@@ -68,8 +68,12 @@ async fn run() {
         Msg::Data(Data::Bytes { data, .. }) => assert_eq!(data, payload),
         _ => panic!("expected the echo"),
     }
-    sc.send_ctrl(&Ctrl::Close).await.unwrap();
+    // The helper shuts down (restart): the client learns at once, not only
+    // after the idle timeout.
+    let stopped = std::time::Instant::now();
+    stop_tx.send(true).unwrap();
     assert!(sc.recv().await.is_err());
+    assert!(stopped.elapsed() < Duration::from_secs(3), "noticed after {:?}", stopped.elapsed());
     server_task.await.unwrap();
 }
 

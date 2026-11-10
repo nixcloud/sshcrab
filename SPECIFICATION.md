@@ -189,12 +189,15 @@ Full `cliclack` workflow:
 
 - On detected disconnect the client reconnects indefinitely with backoff 2 s → 4 s → 8 s → 16 s, then 16 s.
 - Every reconnect performs a full handshake including host-key verification (no cached trust).
-- Status line `reconnecting… (elapsed Ns, next in Ms)` printed via `eprintln` after existing output; not refreshed
-  continuously; completely removed on success (`\r\x1b[K` / cursor-up as needed).
-- A single Ctrl+C while disconnected does **not** alter local or remote sessions; it prints a resume command that
-  replicates the original invocation (UUID + host + port and other original flags, not the remote command; shell-quoted)
-  and exits. The local `sessions/<PID>/session` file is left in place. In interactive raw mode Ctrl+C is detected as byte
-  `0x03` on stdin.
+- While disconnected, a dialog in cliclack's style below the existing output (`client/src/outage.rs`), redrawn every
+  second: `reconnecting… (elapsed Ns, next in Ms)` while waiting, `reconnecting… (elapsed Ns, attempt K: <stage>)`
+  during an attempt (joining the DHT, finding the server, authenticating, resuming). Drawn by hand: cliclack's prompts
+  read the keyboard themselves and its spinner draws from another thread. Completely removed on success (cursor back
+  to where the output left it). Without a terminal on stderr: one line when the connection is lost, one on success.
+- A single Ctrl+C while disconnected, also in the middle of an attempt, does **not** alter local or remote sessions; it
+  shows the dialog as cancelled with a resume command that replicates the original invocation (UUID + host + port and
+  other original flags, not the remote command; shell-quoted) and exits. The local `sessions/<PID>/session` file is
+  left in place. In interactive raw mode Ctrl+C is detected as byte `0x03` on stdin.
 - While connected, Ctrl+C is sent to the remote host and ignored locally: interactive — as the byte in the PTY stream;
   non-interactive — as a `Signal(SIGINT)` control message delivered to the remote process group **[decision]**.
 
@@ -559,7 +562,9 @@ sshcrab ──DHT lookup + hole punch──► sshcrabd-p2p (sandboxed, user ssh
   socket (taking that over would steal the library's own receive path). Our protocol runs inside it unchanged:
   each message is `stream id (1 byte) ‖ message`. `Conn` (`proto/src/transport.rs`) has two backends: the SCTP
   association, and a *pipe* that a bridge task feeds (`Conn::pipe`, `proto/src/p2p.rs` `bridge`). Pipes apply the same
-  15 s idle rule as SCTP; the client still pings every 5 s.
+  15 s idle rule as SCTP, as a deadline that restarting `recv()` does not reset; the client still pings every 5 s.
+  When the helper stops (restart, SIGTERM, sshcrabd gone), it ends every stream properly, so clients notice at once
+  instead of after 15 s.
 - Costs: double encryption (peeroxide's and ours), and control and data share one ordered stream.
 
 ### 13.2 Keys and addresses

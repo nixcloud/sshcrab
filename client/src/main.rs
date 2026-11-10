@@ -3,6 +3,7 @@
 mod attach;
 mod connect;
 mod local;
+mod outage;
 mod ping;
 mod term;
 mod ui;

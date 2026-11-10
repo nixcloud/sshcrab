@@ -78,22 +78,47 @@ check "--ping measures round trips over P2P" "[ $code = 0 ] && grep -q '(P2P)' <
 out=$(printf 'export PATH=%s; tty; exit 5\n' "$PATH" | TERM=xterm-256color c "$ADDR" 2>&1); code=$?
 check "interactive session over P2P runs on a PTY" "grep -q /dev/pts/ <<<\"\$out\" && [ $code = 5 ]"
 
-# The helper restarts (as systemd would) and the address stays the same.
+# The helper restarts (as systemd would) and the address stays the same. A
+# command running meanwhile carries on: its client notices the helper ending
+# the stream, reconnects and gets all output.
+c "$ADDR" "export PATH=$PATH; for i in {1..12}; do echo \$i; sleep 0.5; done; exit 3" </dev/null >"$T/rc.out" 2>"$T/rc.err" &
+RC=$!
+sleep 2
 kill $HELPER; wait $HELPER 2>/dev/null
 check "sshcrabd notices the helper leaving" "sleep 0.5; grep -q 'P2P helper disconnected' '$T/daemon.log'"
 SSHCRAB_P2P_BIND=127.0.0.2 SSHCRAB_P2P_NO_LOCAL=1 "$B/sshcrabd-p2p" --socket "$T/run/p2p.sock" > "$T/helper2.log" 2>&1 &
-PIDS+=($!)
+HELPER=$!
+PIDS+=($HELPER)
 for _ in $(seq 1 30); do grep -q 'announced as' "$T/helper2.log" && break; sleep 0.5; done
 check "a restarted helper announces the same address" "grep -q 'announced as $ADDR' '$T/helper2.log'"
+wait $RC; code=$?
+check "a command over P2P survives a helper restart: exit code" "[ $code = 3 ]"
+check "a command over P2P survives a helper restart: output complete" "seq 1 12 | cmp -s - '$T/rc.out'"
+check "the client said it was reconnecting" "grep -q 'reconnecting…' '$T/rc.err'"
 out=$(c "$ADDR" 'echo again' </dev/null 2>/dev/null)
 check "connections work after a helper restart" "[ '$out' = again ]"
 
 check "connections took the hole-punch path (not a same-host shortcut)" "grep -q 'passive holepunch landed' '$T/helper.log'"
 
 # A wrong key at a known address is a mismatch, as for UDP hosts.
+cp "$T/client/.sshcrab/hostkeys" "$T/hostkeys.good"
 sed -i "s|^$ADDR 0 ssh-ed25519 .*|$ADDR 0 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDgP2oyNSbMWDPXH8G8dXFR4qiCaUvwyEDyrVMxRGrD3|" "$T/client/.sshcrab/hostkeys"
 c "$ADDR" true </dev/null 2>"$T/err"
 check "a changed host key at a known address is reported" "grep -q 'HOST KEY MISMATCH for $ADDR' '$T/err'"
+cp "$T/hostkeys.good" "$T/client/.sshcrab/hostkeys"
+
+# Ctrl+C while reconnecting gives up at once, also in the middle of an attempt
+# (the helper is gone for good, so attempts hang in the DHT lookup).
+SSHCRAB_P2P_BIND=127.0.0.3 SSHCRAB_P2P_NO_LOCAL=1 "$B/sshcrab" --bootstrap 127.0.0.1:$DHT "$ADDR" "export PATH=$PATH; sleep 60" </dev/null 2>"$T/int.err" &
+INT=$!
+sleep 3
+kill $HELPER; wait $HELPER 2>/dev/null
+sleep 5
+start=$EPOCHREALTIME
+kill -INT $INT; wait $INT; code=$?
+took=$(( (${EPOCHREALTIME/./} - ${start/./}) / 1000 ))
+check "Ctrl+C while reconnecting exits at once (${took} ms)" "[ $code = 130 ] && [ $took -lt 2000 ]"
+check "Ctrl+C while reconnecting prints the resume command" "grep -q 'resume with: sshcrab -R ' '$T/int.err'"
 
 # A helper running as a different user would be refused; we can only test the
 # check for root-owned daemons in the NixOS VM test. sshcrabd never links the DHT:

@@ -13,6 +13,7 @@ use std::time::Duration;
 use clap::Parser;
 use sshcrab_proto::p2p::{CONTROL_VERSION, Hello, MAX_CONTROL, Peer, format_address};
 use sshcrab_proto::seqpacket::{SeqPacket, into_unix_stream, stream_pair};
+use tokio::signal::unix::{SignalKind, signal};
 
 #[derive(Parser)]
 #[command(name = "sshcrabd-p2p", version, about = "P2P (DHT) helper of sshcrabd")]
@@ -91,6 +92,30 @@ async fn run(args: Args) -> Result<(), String> {
     drop(hello);
     log::info!("announced as {}", format_address(&server.public_key));
 
+    // On the way out (SIGTERM, sshcrabd gone, an error), every relay ends its
+    // stream properly, so clients reconnect at once instead of waiting for
+    // their idle timeout.
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let mut relays = tokio::task::JoinSet::new();
+    let result = serve(&mut server, &ctl, &mut buf, &mut relays, &stopped).await;
+    let _ = stop.send(true);
+    if !relays.is_empty() {
+        log::info!("closing {} connection(s)", relays.len());
+        let _ = tokio::time::timeout(Duration::from_secs(2), relays.join_all()).await;
+    }
+    let _ = server.handle.destroy().await;
+    result
+}
+
+async fn serve(
+    server: &mut sshcrab_p2p::Server,
+    ctl: &SeqPacket,
+    buf: &mut [u8],
+    relays: &mut tokio::task::JoinSet<()>,
+    stopped: &tokio::sync::watch::Receiver<bool>,
+) -> Result<(), String> {
+    let mut term = signal(SignalKind::terminate()).map_err(|e| format!("SIGTERM handler: {e}"))?;
+    let mut int = signal(SignalKind::interrupt()).map_err(|e| format!("SIGINT handler: {e}"))?;
     loop {
         tokio::select! {
             peer = server.connections.recv() => {
@@ -104,16 +129,21 @@ async fn run(args: Args) -> Result<(), String> {
                 drop(theirs);
                 let local = into_unix_stream(mine).map_err(|e| format!("socketpair: {e}"))?;
                 log::debug!("connection from {}", remote.map_or("an unknown address".into(), |a| a.to_string()));
-                tokio::spawn(async move {
+                let stop = stopped.clone();
+                relays.spawn(async move {
                     let stream = peer.peer.stream;
-                    sshcrab_p2p::relay(stream, local).await;
+                    sshcrab_p2p::relay(stream, local, stop).await;
                     drop(peer.peer.socket);
                 });
             }
-            r = ctl.recv(&mut buf) => match r {
+            // Reap finished relays.
+            Some(_) = relays.join_next(), if !relays.is_empty() => {}
+            r = ctl.recv(buf) => match r {
                 Ok((0, _)) | Err(_) => return Err("sshcrabd went away".into()),
                 Ok(_) => {} // nothing else is defined yet
             },
+            _ = term.recv() => return Ok(()),
+            _ = int.recv() => return Ok(()),
         }
     }
 }
