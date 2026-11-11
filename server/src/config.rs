@@ -133,7 +133,7 @@ mod tests {
         assert!(toml::from_str::<Config>("Bogus = 1").is_err());
         let c: Config = toml::from_str("P2P = true\nP2PBootstrap = [\"10.0.0.1:49737\"]").unwrap();
         assert!(c.p2p && c.bootstrap() == ["10.0.0.1:49737"]);
-        assert_eq!(Config::default().bootstrap()[0], "bootstrap.nixcloud.io:49737");
+        assert_eq!(Config::default().bootstrap()[0], "88.99.3.86@node1.hyperdht.org:49737");
     }
 
     #[test]

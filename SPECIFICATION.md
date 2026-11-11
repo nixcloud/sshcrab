@@ -189,6 +189,10 @@ Full `cliclack` workflow:
 
 - On detected disconnect the client reconnects indefinitely with backoff 2 s → 4 s → 8 s → 16 s, then 16 s.
 - Every reconnect performs a full handshake including host-key verification (no cached trust).
+- The client pings every 2 s while attached (more often than `KEEPALIVE` requires). After 5 s without any message the
+  dialog below already appears: `waiting… (no answer for Ns, reconnecting after 15s)`; it goes away (screen restored)
+  when the server answers again, or turns into the reconnect dialog once the connection counts as dead. This covers a
+  P2P helper that died without ending its streams (killed, crashed): nothing reports that before the 15 s rule.
 - While disconnected, a dialog in cliclack's style below the existing output (`client/src/outage.rs`), redrawn every
   second: `reconnecting… (elapsed Ns, next in Ms)` while waiting, `reconnecting… (elapsed Ns, attempt K: <stage>)`
   during an attempt (joining the DHT, finding the server, authenticating, resuming). Drawn by hand: cliclack's prompts
@@ -291,10 +295,12 @@ encrypted frame (§6.6). The client acknowledges every output chunk; the server 
 
 ### 6.6 Compression
 
-- Enabled only after successful authentication (no decompressor reachable pre-auth).
+- Enabled only after successful authentication (no decompressor reachable pre-auth): the client accepts compressed
+  frames only after `AuthOk`; the server never does.
 - Per-message, independent contexts (no shared streaming dictionary) to limit CRIME-style cross-message leakage.
 - Applied to server→client output only; client stdin (keystrokes, typed passwords) is never compressed.
-- Decompression output is capped at the frame maximum (bomb protection).
+- Decompression output is capped at the frame maximum (bomb protection), and a frame may declare a window of at most
+  128 KiB, the one our compressor uses (ruzstd would otherwise reserve up to 128 MiB up front).
 - Crate: `ruzstd` (pure Rust, "Fastest" ≈ level 1) **[decision]**. The C-based `zstd` crate is not used.
 
 ## 7. Security analysis
@@ -613,8 +619,8 @@ sshcrab ──DHT lookup + hole punch──► sshcrabd-p2p (sandboxed, user ssh
   test mode.
 
 ### 13.6 Bootstrap nodes
-- Default list (`proto::p2p::DEFAULT_BOOTSTRAP`): `bootstrap.nixcloud.io:49737`, then the three public HyperDHT nodes
-  (`node1`–`node3.hyperdht.org`) as fallback: sshcrab joins the *public* HyperDHT network, nixcloud's node is one more
+- Default list (`proto::p2p::DEFAULT_BOOTSTRAP`): the three public HyperDHT nodes
+  (`node1`–`node3.hyperdht.org`): sshcrab joins the *public* HyperDHT network. An own node (below) is one more
   entry point. A private DHT is only a config change (list only own nodes; run at least three then).
 - Server: `P2PBootstrap` in `sshcrabd.toml`. Client: `P2PBootstrap` in `~/.sshcrab/config.toml`, overridden by
   `--bootstrap HOST:PORT` (repeatable). peeroxide resolves host names itself.
@@ -622,7 +628,7 @@ sshcrab ──DHT lookup + hole punch──► sshcrabd-p2p (sandboxed, user ssh
   `services.sshcrab.dhtNode.enable` (+ `port`, `public` = true, `bootstrap`, `openFirewall` = true) runs it sandboxed
   as a `DynamicUser`. A node bound to a wildcard address learns its DHT id (derived from its public address) from
   the nodes it joins; a first node without any must bind its public IPv4 (enforced by the binary and the module).
-  bootstrap.nixcloud.io: a small VPS with a static public IPv4 and UDP 49737 open. The blind relay
+  An own node needs a host with a static public IPv4 and UDP 49737 open. The blind relay
   stays off (bandwidth, abuse).
 
 ### 13.7 Deviations from P2P.md
@@ -669,8 +675,15 @@ sshcrab ──DHT lookup + hole punch──► sshcrabd-p2p (sandboxed, user ssh
      round trip): echo 132 ms → 45 ms, 50 messages there and back 4.4 s → 56 ms. To report upstream.
   Open: real NATs and firewalls are only covered by the VM tests, which still fail; the test environment comes first
   (SPECIFICATION.md §11, test plan).
-- Not yet: the relay for symmetric NATs, IPv6, a fuzz target for the frame decoder, upstream report of peeroxide's
-  unbounded queues, deploying bootstrap.nixcloud.io (the name does not resolve yet; clients fall back to the public
-  nodes).
+- **Connection slots (fixed):** peeroxide 1.7.4 gave a connection's `max_peers` slot back only when setting it up
+  failed, so after 64 connections in total (every client uses a fresh key) the helper accepted none until it
+  restarted. Fixed in a vendored copy (`vendor/peeroxide/SSHCRAB-PATCH.md`), test `p2p/tests/slots.rs`.
+- **Open denial-of-service issues in peeroxide** (from a review, 2026-11-11): fake announcements on a server's topic
+  are dialled too and hold up the real one (their slots now come back once dropped); a lookup reply with a huge
+  count can crash the client
+  (`hyperdht_messages.rs`, unbounded `Vec::with_capacity`); SecretStream allocates a frame of up to 16 MiB before
+  authenticating it, so a few connections reach the helper's `MemoryMax`.
+- Not yet: the relay for symmetric NATs, IPv6, a fuzz target for the frame decoder, upstream reports of the
+  libudx and peeroxide patches and of the issues above.
 - A client that refuses the host key exits before its bridge has closed the peeroxide stream; sshcrabd notices only
   at the 10 s handshake timeout (one pre-auth slot meanwhile), as with any client that vanishes.

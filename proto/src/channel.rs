@@ -7,6 +7,8 @@
 //! a lost, replayed or reordered message fails authentication and ends the channel.
 //!
 //! Plaintext frame: one flag byte (bit 0 = zstd-compressed) + postcard body.
+//! Only server output is compressed, and the client accepts it only once the
+//! server authenticated: no decompressor is reachable before login (spec §6.6).
 
 use std::io::Read;
 
@@ -24,6 +26,9 @@ const FLAG_COMPRESSED: u8 = 1;
 const MAX_PLAINTEXT: usize = MAX_CHUNK + 1024;
 /// Data smaller than this is never compressed (keystrokes, spec §6.6).
 const COMPRESS_MIN: usize = 256;
+/// The window our compressor declares (ruzstd's fastest level). A frame may
+/// claim up to 128 MiB, which the decoder would reserve up front.
+const MAX_WINDOW: u64 = 128 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ChannelError {
@@ -52,6 +57,8 @@ pub struct SecureConn {
     send_ctr: [u64; 2],
     recv_ctr: [u64; 2],
     compress: bool,
+    /// Compressed frames are accepted (client, after the server authenticated).
+    inflate: bool,
 }
 
 fn nonce(stream: u16, ctr: u64) -> Result<u64, ChannelError> {
@@ -63,16 +70,21 @@ fn nonce(stream: u16, ctr: u64) -> Result<u64, ChannelError> {
 
 impl SecureConn {
     pub(crate) fn new(conn: Conn, noise: StatelessTransportState) -> Self {
-        SecureConn { conn, noise, send_ctr: [0; 2], recv_ctr: [0; 2], compress: false }
+        SecureConn { conn, noise, send_ctr: [0; 2], recv_ctr: [0; 2], compress: false, inflate: false }
     }
 
     pub fn remote(&self) -> crate::transport::Remote {
         self.conn.remote()
     }
 
-    /// Turn on compression of outgoing `Data` (only after authentication, spec §6.6).
+    /// Server: compress outgoing output from now on (after authentication, spec §6.6).
     pub fn enable_compression(&mut self) {
         self.compress = true;
+    }
+
+    /// Client: accept compressed output from now on (the server authenticated).
+    pub fn accept_compressed(&mut self) {
+        self.inflate = true;
     }
 
     pub async fn send_ctrl(&mut self, msg: &Ctrl) -> Result<(), ChannelError> {
@@ -133,7 +145,7 @@ impl SecureConn {
         let (&flags, body) = plain.split_first().ok_or(ChannelError::Malformed)?;
         let body = match flags {
             0 => body.to_vec(),
-            FLAG_COMPRESSED if stream == STREAM_DATA => decompress(body)?,
+            FLAG_COMPRESSED if stream == STREAM_DATA && self.inflate => decompress(body)?,
             _ => return Err(ChannelError::Malformed),
         };
         Ok(if stream == STREAM_CTRL { Msg::Ctrl(decode(&body)?) } else { Msg::Data(decode(&body)?) })
@@ -149,7 +161,8 @@ fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T, ChannelError> {
 }
 
 fn decompress(body: &[u8]) -> Result<Vec<u8>, ChannelError> {
-    let decoder = ruzstd::decoding::StreamingDecoder::new(body).map_err(|_| ChannelError::Malformed)?;
+    let decoder = ruzstd::decoding::StreamingDecoder::new_with_max_window_size(body, MAX_WINDOW)
+        .map_err(|_| ChannelError::Malformed)?;
     let mut out = Vec::new();
     decoder
         .take(MAX_PLAINTEXT as u64 + 1)
@@ -159,4 +172,21 @@ fn decompress(body: &[u8]) -> Result<Vec<u8>, ChannelError> {
         return Err(ChannelError::TooLarge);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A zstd frame of one raw block holding `a`, declaring `window` (descriptor byte).
+    fn frame(window: u8) -> Vec<u8> {
+        vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, window, 0x09, 0x00, 0x00, b'a']
+    }
+
+    #[test]
+    fn a_frame_may_not_claim_a_large_window() {
+        assert_eq!(decompress(&frame(0x00)).unwrap(), b"a", "1 KiB window");
+        // 0x88 = 128 MiB, which the decoder would reserve before reading a byte.
+        assert!(matches!(decompress(&frame(0x88)), Err(ChannelError::Malformed)));
+    }
 }

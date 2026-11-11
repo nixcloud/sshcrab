@@ -1,13 +1,13 @@
 [workspace]
 resolver = "3"
 members = ["proto", "client", "server", "p2p"]
-# vendor/libudx: patched copy (see [patch.crates-io] below), not a member.
+# vendor/libudx, vendor/peeroxide: patched copies (see [patch.crates-io] below), not members.
 exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "AGPL-3.0-or-later"
+license = "Unlicense"
 
 [workspace.dependencies]
 sshcrab-proto = { path = "proto" }
@@ -44,3 +44,4 @@ panic = "unwind"
 # upstream waits a full round trip per write and per flush.
 [patch.crates-io]
 libudx = { path = "vendor/libudx" }
+peeroxide = { path = "vendor/peeroxide" }

@@ -124,7 +124,7 @@ in
       bootstrap = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = [ ];
-        example = [ "bootstrap.nixcloud.io:49737" ];
+        example = [ "dht.example.org:49737" ];
         description = "DHT bootstrap nodes (`host:port`); empty = sshcrab's built-in list.";
       };
 
@@ -136,7 +136,7 @@ in
     };
 
     dhtNode = {
-      enable = lib.mkEnableOption "a DHT bootstrap node (sshcrab-dht-node), such as bootstrap.nixcloud.io";
+      enable = lib.mkEnableOption "a DHT bootstrap node (sshcrab-dht-node)";
 
       package = lib.mkOption {
         type = lib.types.package;

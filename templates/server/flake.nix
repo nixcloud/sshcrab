@@ -3,7 +3,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
-    sshcrab.url = "github:nixcloud/nixcloud.sshcrab";
+    sshcrab.url = "github:nixcloud/sshcrab";
   };
 
   outputs = { nixpkgs, sshcrab, ... }: {

@@ -125,7 +125,7 @@ pub async fn client(
         .await?;
     match recv_ctrl(&mut sc).await? {
         Ctrl::AuthOk => {
-            sc.enable_compression();
+            sc.accept_compressed();
             Ok(sc)
         }
         Ctrl::AuthFail { message } => Err(HandshakeError::AuthFailed { message }),
@@ -276,6 +276,17 @@ mod tests {
         s.close();
         assert!(matches!(c.recv().await.unwrap(), Msg::Ctrl(Ctrl::Pong)));
         assert!(c.recv().await.is_err());
+    }
+
+    /// Only the client decompresses; the server never runs the decoder.
+    #[tokio::test]
+    async fn the_server_refuses_compressed_data() {
+        let (client, server, _) = pair(true, true).await;
+        let (mut c, (mut s, _)) = (client.unwrap(), server.unwrap());
+        c.enable_compression();
+        let big = vec![b'x'; 16 * 1024];
+        c.send_data(&Data::Bytes { stream: DataStream::Stdout, offset: 0, data: big }).await.unwrap();
+        assert!(matches!(s.recv().await, Err(ChannelError::Malformed)));
     }
 
     #[tokio::test]

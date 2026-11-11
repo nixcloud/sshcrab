@@ -21,9 +21,8 @@ pub const SUFFIX: &str = ".p2p";
 pub(crate) const SEED_LABEL: &[u8] = b"sshcrab-p2p-v1";
 
 /// Used when neither the config nor the command line names bootstrap nodes:
-/// nixcloud's node first, the public HyperDHT nodes as fallback (spec §13.6).
+/// the public HyperDHT nodes (spec §13.6).
 pub const DEFAULT_BOOTSTRAP: &[&str] = &[
-    "bootstrap.nixcloud.io:49737",
     "88.99.3.86@node1.hyperdht.org:49737",
     "142.93.90.113@node2.hyperdht.org:49737",
     "138.68.147.8@node3.hyperdht.org:49737",

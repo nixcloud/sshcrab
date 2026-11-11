@@ -103,7 +103,7 @@
           let p = self.packages.${final.stdenv.hostPlatform.system};
           in { inherit (p) sshcrab sshcrabd sshcrab-p2p; };
 
-        # nix flake init -t github:nixcloud/nixcloud.sshcrab#server
+        # nix flake init -t github:nixcloud/sshcrab#server
         templates.server = {
           path = ./templates/server;
           description = "NixOS server with sshcrabd and the P2P helper";

@@ -1075,8 +1075,6 @@ dependencies = [
 [[package]]
 name = "peeroxide"
 version = "1.7.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10990aef71ca02d81ce797121b96729625e67c6c9967a64be5fd9a574bd71085"
 dependencies = [
  "libudx",
  "peeroxide-dht",

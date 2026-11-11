@@ -1,3 +1,9 @@
 /target
 /result
 /result-*
+
+# private keys from local testing; never commit them
+/host_key
+/host_key.pub
+/mytestkey
+/mytestkey.pub

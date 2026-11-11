@@ -13,11 +13,21 @@ The design and the security analysis are in [SPECIFICATION.md](SPECIFICATION.md)
 | `sshcrab-keygen-ed25519` | your machine | creates your key |
 | `sshcrabd` | server, as root | the daemon; never links the P2P code |
 | `sshcrabd-p2p` | server, unprivileged and sandboxed | announces the server in the DHT and passes connections to `sshcrabd` |
-| `sshcrab-dht-node` | optional, a public host | a DHT bootstrap node (such as bootstrap.nixcloud.io) |
+| `sshcrab-dht-node` | optional, a public host | a DHT bootstrap node, for a private DHT or as an extra entry point |
 
-> Status: young software (see SPECIFICATION.md §12 and §13.8). Do not make it the only way into a machine yet.
-> **P2P status:** works in the host tests and through a real NAT (Starlink, a home network); no relay yet for
-> symmetric NATs. Treat it as experimental, and mind the security notes before enabling it.
+> [!WARNING]
+> **Prototype code. Not hardened, not reviewed; do not expose it to untrusted networks.** This holds for both
+> ways in: direct SCTP/UDP and the P2P backend. Before it is fit for that it needs at least:
+>
+> - **Both paths:** privilege separation. Today `sshcrabd` parses network input as root; the planned split
+>   into a root monitor and a sandboxed network worker is not done (SPECIFICATION.md §7.4). Also fuzzing, a
+>   constant-time login path (user names can be told apart by timing) and an external review of the handshake.
+> - **P2P:** peeroxide (DHT, hole punching, its encryption) is young and unaudited. sshcrab carries patched
+>   copies of it and of libudx (`vendor/`), and a few denial-of-service issues in it are open (SPECIFICATION.md
+>   §13.8). There is no relay for symmetric NATs.
+>
+> Our own encryption layer (Noise + Ed25519, the same on both paths) is the part reviewed most so far. Use sshcrab
+> next to OpenSSH, never as the only way into a machine.
 
 ## How it works
 
@@ -35,8 +45,9 @@ the daemon's memory only, so a daemon restart ends them.
 - **Resuming** (`sshcrab -R`): the client picks a session and continues it; one that is attached elsewhere can be
   taken over. A shell gets its last 64 KiB of output replayed, a full-screen program (htop, vim) is made to
   repaint at the new window size, and the terminal modes it had set (alternate screen, mouse, …) are restored.
-- **Liveness.** Both sides ping every 5 s over the encrypted channel; a connection silent for 15 s is dead. The
-  session survives that, and an interactive client reconnects on its own.
+- **Liveness.** The client pings every 2 s over the encrypted channel and says so after 5 s without an answer; a
+  connection silent for 15 s is dead. The session survives that, and an interactive client reconnects on
+  its own.
 
 ### Two ways to reach a server
 
@@ -86,6 +97,7 @@ and the session protocol do not depend on the transport below.
 | **P2P: our encryption inside peeroxide's** | peeroxide's own layer is what lets only the holder of the P2P key answer at an address. Ours keeps the host key authenticated end to end, so the helper and DHT nodes never see plaintext. Costs only CPU. | SPEC §13.1, §13.3 |
 | **P2P in a separate, unprivileged helper** | The DHT and hole-punching code (young, unaudited) handles internet traffic; it runs sandboxed with no access to the host and hands each connection to `sshcrabd` as a file descriptor. | SPEC §13.4–13.5 |
 | **libudx patched** (`vendor/libudx`) | Upstream 1.7.4 waited a full round trip per write and per flush: about 200 ms per keystroke at a 40 ms ping. Now one round trip, like ssh. | `vendor/libudx/SSHCRAB-PATCH.md` |
+| **peeroxide patched** (`vendor/peeroxide`) | Upstream 1.7.4 never gave a connection's slot back once it was established: after 64 connections in total the helper accepted no more until restarted. | `vendor/peeroxide/SSHCRAB-PATCH.md` |
 
 Trade-offs of the P2P path compared with direct SCTP: control and data share one ordered stream (a lost packet
 delays both), and retransmissions follow libudx's timer (minimum 1 s) instead of ours (0.5 s). Measure with
@@ -94,7 +106,7 @@ delays both), and retransmissions follow libudx's timer (minimum 1 s) instead of
 ## 1. Your key (client)
 
 ```sh
-nix profile install github:nixcloud/nixcloud.sshcrab#sshcrab
+nix profile install github:nixcloud/sshcrab#sshcrab
 sshcrab-keygen-ed25519 ~/.sshcrab/id_ed25519
 cat ~/.sshcrab/id_ed25519.pub      # goes into the server configuration below
 ```
@@ -109,7 +121,7 @@ the NixOS module straight from the flake and keeps `nixos-rebuild switch` as it 
 { config, pkgs, ... }:
 let
   # Pin a commit: without one, every rebuild may pick up a newer sshcrab.
-  sshcrab = builtins.getFlake "github:nixcloud/nixcloud.sshcrab/<commit>";
+  sshcrab = builtins.getFlake "github:nixcloud/sshcrab/<commit>";
 in
 {
   imports = [
@@ -150,7 +162,7 @@ let
     sha256 = "<hash>";
   }) {
     src = fetchTarball {
-      url = "https://github.com/nixcloud/nixcloud.sshcrab/archive/<commit>.tar.gz";
+      url = "https://github.com/nixcloud/sshcrab/archive/<commit>.tar.gz";
       sha256 = "<hash>";
     };
   }).defaultNix;
@@ -165,12 +177,12 @@ in
 
 ```nix
 # flake.nix
-inputs.sshcrab.url = "github:nixcloud/nixcloud.sshcrab";
+inputs.sshcrab.url = "github:nixcloud/sshcrab";
 # nixosSystem { modules = [ sshcrab.nixosModules.default ./configuration.nix ]; }
 ```
 
 ```sh
-nix flake init -t github:nixcloud/nixcloud.sshcrab#server
+nix flake init -t github:nixcloud/sshcrab#server
 nixos-rebuild switch --flake .#myserver     # --target-host root@server for a remote machine
 ```
 
@@ -223,11 +235,10 @@ relay yet.
 Bootstrap nodes for the client: `~/.sshcrab/config.toml`
 
 ```toml
-P2PBootstrap = ["bootstrap.nixcloud.io:49737"]
+P2PBootstrap = ["dht.example.org:49737"]
 ```
 
-or `--bootstrap HOST:PORT` (repeatable). Without either, the built-in list is used: bootstrap.nixcloud.io first,
-then the public HyperDHT nodes.
+or `--bootstrap HOST:PORT` (repeatable). Without either, the built-in list is used: the public HyperDHT nodes.
 
 ## 4. Other Linux distributions (systemd)
 
@@ -235,7 +246,7 @@ Install the binaries with Nix and link the unit files:
 
 ```sh
 nix profile install --profile /nix/var/nix/profiles/sshcrab \
-    github:nixcloud/nixcloud.sshcrab#default github:nixcloud/nixcloud.sshcrab#systemd-units
+    github:nixcloud/sshcrab#default github:nixcloud/sshcrab#systemd-units
 P=/nix/var/nix/profiles/sshcrab
 sudo systemd-sysusers $P/lib/sysusers.d/sshcrab.conf          # creates the sshcrab-p2p user
 sudo install -d -m 0700 /var/lib/sshcrab
@@ -251,7 +262,7 @@ upgrade the profile and run `systemctl daemon-reload` and restart both services.
 For a server that should run NixOS instead, [nixos-anywhere](https://github.com/nix-community/nixos-anywhere)
 installs the template configuration over SSH.
 
-## 5. A bootstrap node (bootstrap.nixcloud.io)
+## 5. A bootstrap node
 
 Needed only if you do not want to depend on the public HyperDHT nodes. On a host with a static public IPv4:
 
@@ -266,7 +277,7 @@ A node's DHT id derives from its public address. Bound to `0.0.0.0` it learns th
 joins, so a first node of a private DHT must bind its public IPv4 (the module refuses otherwise). Then point
 clients and servers at it (`p2p.bootstrap`, `P2PBootstrap`). With `public = false` and only your own nodes
 in the lists you get a private DHT; run at least three nodes then. To try without installing anything:
-`nix run github:nixcloud/nixcloud.sshcrab#sshcrab-dht-node -- --public`.
+`nix run github:nixcloud/sshcrab#sshcrab-dht-node -- --public`.
 
 ## 6. Development
 
@@ -278,3 +289,23 @@ nix build .#checks.x86_64-linux.p2p  # NixOS VM test: DHT node, NAT router, serv
 ```
 
 `nix/test-keys/alice` is a throwaway key for the VM test, public on purpose. Do not use it anywhere else.
+
+## 7. Changes to the peeroxide code
+
+sshcrab builds two crates of the [peeroxide](https://crates.io/crates/peeroxide) project from patched copies in
+`vendor/`, used through `[patch.crates-io]` in `Cargo.toml`. Everything else of peeroxide (`peeroxide-dht`: the DHT,
+hole punching, Noise, SecretStream) is used unchanged from crates.io. Each copy is upstream 1.7.4 plus the changes
+below; the full diff is in `sshcrab.patch` next to it. Both are to be reported upstream, and a copy is dropped once
+upstream has an equivalent fix.
+
+| Crate | Upstream problem | Change | Test |
+|---|---|---|---|
+| `libudx` 1.7.4 ([details](vendor/libudx/SSHCRAB-PATCH.md)) | `UdxAsyncStream` allowed one unacknowledged write at a time, and `flush` waited for the ACK. SecretStream writes every message as header, body, flush, so each message cost two round trips: about 200 ms per keystroke at a 40 ms ping. | Writes return once queued (backpressure only above 1 MiB unacknowledged); `flush` no longer waits for ACKs; small writes are appended to the newest unsent packet; `shutdown` sends the FIN behind all data and waits until everything, FIN included, is acknowledged. | `p2p/tests/latency.rs` |
+| `peeroxide` 1.7.4 ([details](vendor/peeroxide/SSHCRAB-PATCH.md)) | A swarm counts connections against `max_peers` (64 in the helper) but gave a slot back only when setting up a connection failed, never when an established one ended. Every client uses a fresh key, so after 64 connections in total (reconnects included) `sshcrabd-p2p` ignored every new client until restarted; 64 throwaway keys did it on purpose. | Each `SwarmConnection` holds a slot guard that gives the slot back when the connection is dropped. Slots carry an id, so dropping an old connection never frees the slot of a newer one with the same key. | `p2p/tests/slots.rs` |
+
+Not changed, but known (SPECIFICATION.md §13.8): a few denial-of-service issues in `peeroxide-dht` are open
+(unbounded allocations from a lookup reply and from SecretStream frame lengths before authentication).
+
+## License
+
+Public domain ([Unlicense](LICENSE)). The patched crates in `vendor/` keep their own license (MIT OR Apache-2.0).

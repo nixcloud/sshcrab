@@ -1,5 +1,5 @@
-//! sshcrab-dht-node: a long-running DHT node to bootstrap from, such as
-//! bootstrap.nixcloud.io (spec §13.6). Carries no sshcrab traffic.
+//! sshcrab-dht-node: a long-running DHT node to bootstrap from, for a private
+//! DHT or as an extra entry point (spec §13.6). Carries no sshcrab traffic.
 
 use clap::Parser;
 use sshcrab_proto::p2p::DHT_NODE_PORT;
