@@ -298,12 +298,7 @@ async fn attach_mode(
     }
     let mut session = Session::new(id, interactive);
     session.enter_terminal(&terminal);
-    let runner = Runner {
-        connector,
-        session,
-        stdin: attach::stdin_reader(),
-        resume_command: resume_command.replace("{id}", &id.to_string()),
-    };
+    let runner = Runner::new(connector, session, resume_command.replace("{id}", &id.to_string()));
     match runner.run(sc, replay).await {
         Outcome::Exit(code) => {
             file.map(local::SessionFile::remove);

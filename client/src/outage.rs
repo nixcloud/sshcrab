@@ -82,6 +82,10 @@ impl Dialog {
         self.drawn = true;
     }
 
+    pub fn set_title(&mut self, title: String) {
+        self.title = title;
+    }
+
     /// The window changed size: draw everything again for the new size.
     pub fn resize(&mut self, screen: Option<vt100::Screen>) {
         if self.backdrop.is_some() && self.drawn {

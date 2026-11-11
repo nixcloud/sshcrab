@@ -1,11 +1,11 @@
 //! An attached session: I/O forwarding, keepalive, reconnect (spec §4.3, §4.7).
 
 use std::collections::VecDeque;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant};
 
-use sshcrab_proto::channel::{Msg, SecureConn};
-use sshcrab_proto::transport::KEEPALIVE;
+use sshcrab_proto::channel::{ChannelError, Msg, SecureConn};
+use sshcrab_proto::transport::IDLE_TIMEOUT;
 use sshcrab_proto::vt::Modes;
 use sshcrab_proto::wire::{Attach, AttachRefusal, Ctrl, Data, DataStream, MAX_CHUNK, Offsets};
 use tokio::signal::unix::{SignalKind, signal};
@@ -18,6 +18,12 @@ use crate::{term, ui};
 
 const BACKOFF: [u64; 4] = [2, 4, 8, 16];
 const CTRL_C: u8 = 3;
+/// Ping this often while attached: more often than the protocol needs
+/// (`KEEPALIVE`), so a silent server shows soon.
+const PING: Duration = Duration::from_secs(2);
+/// No message for this long: say so, before the connection counts as dead
+/// (`IDLE_TIMEOUT`, 15 s) and reconnecting starts.
+const STALL: Duration = Duration::from_secs(5);
 
 pub enum Outcome {
     Exit(i32),
@@ -116,7 +122,7 @@ impl Session {
 }
 
 /// Stdin, read on a plain thread (blocking reads); `None` = EOF.
-pub fn stdin_reader() -> mpsc::Receiver<Option<Vec<u8>>> {
+fn stdin_reader() -> mpsc::Receiver<Option<Vec<u8>>> {
     let (tx, rx) = mpsc::channel(64);
     std::thread::spawn(move || {
         use std::io::Read;
@@ -150,20 +156,38 @@ enum End {
     Exit(i32),
     Kicked(String),
     Lost,
+    /// Ctrl+C while the server did not answer.
+    Abort,
+}
+
+/// The outage dialog and the last time anything came from the server.
+struct Outage {
+    dialog: Dialog,
+    since: Instant,
 }
 
 pub struct Runner<'a> {
-    pub connector: &'a Connector,
-    pub session: Session,
-    pub stdin: mpsc::Receiver<Option<Vec<u8>>>,
+    connector: &'a Connector,
+    session: Session,
+    stdin: mpsc::Receiver<Option<Vec<u8>>>,
     /// Printed on Ctrl+C while disconnected.
-    pub resume_command: String,
+    resume_command: String,
+    /// Shown while the server does not answer, kept on into reconnecting.
+    outage: Option<Outage>,
 }
 
-impl Runner<'_> {
+impl<'a> Runner<'a> {
+    pub fn new(connector: &'a Connector, session: Session, resume_command: String) -> Self {
+        Runner { connector, session, stdin: stdin_reader(), resume_command, outage: None }
+    }
+
     pub async fn run(mut self, mut sc: SecureConn, mut replay: Offsets) -> Outcome {
         loop {
             match self.attached(&mut sc, replay).await {
+                End::Abort => {
+                    let Outage { dialog, since } = self.outage.take().expect("shown before Ctrl+C counts");
+                    return self.abort(dialog, since);
+                }
                 End::Exit(code) => {
                     goodbye(&mut sc).await;
                     self.session.leave_terminal();
@@ -253,14 +277,16 @@ impl Runner<'_> {
         }
         let mut winch = signal(SignalKind::window_change()).expect("SIGWINCH handler");
         let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
-        let mut ping = tokio::time::interval(KEEPALIVE);
+        let mut ping = tokio::time::interval(PING);
         ping.tick().await;
+        let mut last_contact = Instant::now();
+        let mut watch = tokio::time::interval(Duration::from_secs(1));
         // Exit arrives on the control stream and may overtake the last output.
         let mut exit: Option<(i32, Offsets)> = None;
 
         loop {
             tokio::select! {
-                msg = sc.recv() => match msg {
+                msg = sc.recv() => match self.heard(msg, &mut last_contact) {
                     Ok(Msg::Data(Data::Bytes { stream, offset, data })) => {
                         let got = match stream {
                             DataStream::Stdout => &mut self.session.received.stdout,
@@ -315,6 +341,9 @@ impl Runner<'_> {
                 },
                 input = self.stdin.recv(), if !self.session.stdin_eof => match input {
                     Some(Some(data)) => {
+                        if self.outage.is_some() && self.session.interactive && data.contains(&CTRL_C) {
+                            return End::Abort;
+                        }
                         let from = self.session.stdin_acked + self.session.stdin_buf.len() as u64;
                         self.session.stdin_buf.extend(&data);
                         if !self.send_stdin(sc, from).await {
@@ -330,18 +359,26 @@ impl Runner<'_> {
                 },
                 _ = winch.recv() => {
                     self.session.resize_screen();
+                    if let Some(o) = &mut self.outage {
+                        o.dialog.resize(self.session.screen());
+                    }
                     if let Some((cols, rows)) = term::window_size() {
                         if sc.send_ctrl(&Ctrl::WindowSize { cols, rows }).await.is_err() {
                             return End::Lost;
                         }
                     }
                 }
-                // Without a PTY, Ctrl+C arrives as SIGINT; it goes to the remote side.
+                // Without a PTY, Ctrl+C arrives as SIGINT; it goes to the remote side,
+                // unless the server is not answering (see the dialog).
                 _ = sigint.recv() => {
+                    if self.outage.is_some() {
+                        return End::Abort;
+                    }
                     if sc.send_ctrl(&Ctrl::Signal(libc::SIGINT)).await.is_err() {
                         return End::Lost;
                     }
                 }
+                _ = watch.tick() => self.watch_contact(last_contact),
                 _ = ping.tick() => {
                     if sc.send_ctrl(&Ctrl::Ping).await.is_err() {
                         return End::Lost;
@@ -351,14 +388,56 @@ impl Runner<'_> {
         }
     }
 
+    /// Something came from the server: it is alive, and the real screen comes
+    /// back (before any output is written to it).
+    fn heard(&mut self, msg: Result<Msg, ChannelError>, last_contact: &mut Instant) -> Result<Msg, ChannelError> {
+        if msg.is_ok() {
+            *last_contact = Instant::now();
+            if let Some(o) = self.outage.take() {
+                o.dialog.close();
+            }
+        }
+        msg
+    }
+
+    /// Show the dialog once the server has been silent for [`STALL`], until it
+    /// answers again or the connection counts as dead (then `reconnect` takes
+    /// the dialog over). Only on a terminal: in a log it would only be noise.
+    fn watch_contact(&mut self, last_contact: Instant) {
+        let quiet = last_contact.elapsed();
+        if quiet < STALL || !std::io::stderr().is_terminal() {
+            return;
+        }
+        let target = &self.connector.target;
+        let o = self.outage.get_or_insert_with(|| Outage {
+            dialog: Dialog::new(
+                format!("no answer from {}@{}", target.user, target.host),
+                self.session.col,
+                self.session.screen(),
+            ),
+            since: last_contact,
+        });
+        o.dialog.update(&format!(
+            "waiting… (no answer for {}s, reconnecting after {}s)",
+            quiet.as_secs(),
+            IDLE_TIMEOUT.as_secs()
+        ));
+    }
+
     /// Reconnect with backoff, showing the outage dialog. Ctrl+C leaves at any
     /// moment, also in the middle of an attempt; other keystrokes are kept and
     /// sent once the session is back.
     async fn reconnect(&mut self) -> Result<(SecureConn, Offsets), Outcome> {
-        let since = Instant::now();
         let target = &self.connector.target;
         let title = format!("connection to {}@{} lost", target.user, target.host);
-        let mut dialog = Dialog::new(title, self.session.col, self.session.screen());
+        // The dialog may be up already: the server went silent first.
+        let (mut dialog, since) = match self.outage.take() {
+            Some(Outage { mut dialog, since }) => {
+                dialog.set_title(title);
+                (dialog, since)
+            }
+            None => (Dialog::new(title, self.session.col, self.session.screen()), Instant::now()),
+        };
         let mut winch = signal(SignalKind::window_change()).expect("SIGWINCH handler");
         let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
         let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -370,7 +449,7 @@ impl Runner<'_> {
                     _ = tokio::time::sleep_until(next) => break,
                     _ = tick.tick() => {
                         let left = next.saturating_duration_since(tokio::time::Instant::now());
-                        let left = left.as_secs_f32().ceil() as u64;
+                        let left = (left.as_secs_f32().ceil() as u64).max(1);
                         dialog.update(&format!("reconnecting… (elapsed {}s, next in {left}s)", since.elapsed().as_secs()));
                     }
                     _ = sigint.recv() => return Err(self.abort(dialog, since)),
