@@ -29,6 +29,8 @@ The design and the security analysis are in [SPECIFICATION.md](SPECIFICATION.md)
 > Our own encryption layer (Noise + Ed25519, the same on both paths) is the part reviewed most so far. Use sshcrab
 > next to OpenSSH, never as the only way into a machine.
 
+![sshcrab](./sshcrab.jpg)
+
 ## How it works
 
 ### Sessions outlive connections
