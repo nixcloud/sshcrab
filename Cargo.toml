@@ -1,8 +1,6 @@
 [workspace]
 resolver = "3"
 members = ["proto", "client", "server", "p2p"]
-# vendor/libudx, vendor/peeroxide: patched copies (see [patch.crates-io] below), not members.
-exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -40,8 +38,3 @@ libc = "0.2"
 [profile.release]
 panic = "unwind"
 
-# libudx 1.7.4 with a non-blocking AsyncWrite (vendor/libudx/SSHCRAB-PATCH.md):
-# upstream waits a full round trip per write and per flush.
-[patch.crates-io]
-libudx = { path = "vendor/libudx" }
-peeroxide = { path = "vendor/peeroxide" }

@@ -127,18 +127,17 @@ pub async fn connect(bootstrap: &[String], remote: [u8; 32], progress: impl Fn(S
     progress(Stage::JoiningDht);
     let (task, handle, mut connections) = peeroxide::spawn(cfg).await?;
     let swarm = Swarm { handle, task };
-    let topic = peeroxide::discovery_key(&remote);
     if swarm.handle.dht().table_size().await.unwrap_or(0) == 0 {
         return Err(P2pError::NoNodes(bootstrap.join(", ")));
     }
     log::debug!("joined the DHT in {:?}", start.elapsed());
     progress(Stage::FindingServer);
-    let mut opts = peeroxide::JoinOpts::default();
-    opts.server = false;
-    opts.client = true;
-    swarm.handle.join(topic, opts).await?;
-    // Anyone may announce on the topic; only the holder of `remote` counts
-    // (Noise IK authenticated the key the swarm reports).
+    // Dial the server's key itself rather than every peer announced on its
+    // topic (anyone may announce there). It does not yet protect against
+    // announcers under that target: see tests/impostors.rs.
+    swarm.handle.join_peer(remote).await?;
+    // Only the holder of `remote` counts (Noise IK authenticated the key the
+    // swarm reports); nothing else should arrive, as we announce nothing.
     let peer = loop {
         let c = connections.recv().await.ok_or(P2pError::WrongPeer)?;
         if c.remote_public_key() == &remote {
@@ -146,8 +145,8 @@ pub async fn connect(bootstrap: &[String], remote: [u8; 32], progress: impl Fn(S
         }
     };
     log::debug!("connected to {:?} after {:?}", peer.peer.remote_addr, start.elapsed());
-    // One connection is all we want; no further dialling.
-    let _ = swarm.handle.leave(topic).await;
+    // One connection is all we want: no redialling once it closes.
+    let _ = swarm.handle.leave_peer(remote).await;
     let (conn, ends) = Conn::pipe(Remote::P2p(peer.peer.remote_addr));
     tokio::spawn(async move {
         let peer = peer;

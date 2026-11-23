@@ -8,9 +8,9 @@ description = "P2P (HyperDHT) backend of sshcrab: client connector, sshcrabd-p2p
 [dependencies]
 sshcrab-proto.workspace = true
 # Pinned exactly: young, unaudited stack (SPECIFICATION.md §13).
-peeroxide = "=1.7.4"
-peeroxide-dht = "=1.7.4"
-libudx = "=1.7.4"
+peeroxide = "=1.8.1"
+peeroxide-dht = "=1.8.1"
+libudx = "=1.8.1"
 tokio.workspace = true
 clap.workspace = true
 nix.workspace = true

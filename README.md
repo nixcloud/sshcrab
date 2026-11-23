@@ -22,9 +22,10 @@ The design and the security analysis are in [SPECIFICATION.md](SPECIFICATION.md)
 > - **Both paths:** privilege separation. Today `sshcrabd` parses network input as root; the planned split
 >   into a root monitor and a sandboxed network worker is not done (SPECIFICATION.md §7.4). Also fuzzing, a
 >   constant-time login path (user names can be told apart by timing) and an external review of the handshake.
-> - **P2P:** peeroxide (DHT, hole punching, its encryption) is young and unaudited. sshcrab carries patched
->   copies of it and of libudx (`vendor/`), and a few denial-of-service issues in it are open (SPECIFICATION.md
->   §13.8). There is no relay for symmetric NATs.
+> - **P2P:** peeroxide (DHT, hole punching, its encryption) is young and unaudited; several denial-of-service
+>   issues were fixed upstream only in 1.8.0 (section 7), and one is open: **anyone can make a P2P server
+>   unreachable** by announcing under its key in the DHT (SPECIFICATION.md §13.8). There is no relay for
+>   symmetric NATs.
 >
 > Our own encryption layer (Noise + Ed25519, the same on both paths) is the part reviewed most so far. Use sshcrab
 > next to OpenSSH, never as the only way into a machine.
@@ -98,8 +99,6 @@ and the session protocol do not depend on the transport below.
 | **P2P: no SCTP on top of UDX** | Two reliable layers stacked on each other both retransmit and fight each other ("TCP over TCP"). UDX provides retransmission, ordering and congestion control; our messages travel as `stream id ‖ message` frames on one UDX stream. | SPEC §13.1 |
 | **P2P: our encryption inside peeroxide's** | peeroxide's own layer is what lets only the holder of the P2P key answer at an address. Ours keeps the host key authenticated end to end, so the helper and DHT nodes never see plaintext. Costs only CPU. | SPEC §13.1, §13.3 |
 | **P2P in a separate, unprivileged helper** | The DHT and hole-punching code (young, unaudited) handles internet traffic; it runs sandboxed with no access to the host and hands each connection to `sshcrabd` as a file descriptor. | SPEC §13.4–13.5 |
-| **libudx patched** (`vendor/libudx`) | Upstream 1.7.4 waited a full round trip per write and per flush: about 200 ms per keystroke at a 40 ms ping. Now one round trip, like ssh. | `vendor/libudx/SSHCRAB-PATCH.md` |
-| **peeroxide patched** (`vendor/peeroxide`) | Upstream 1.7.4 never gave a connection's slot back once it was established: after 64 connections in total the helper accepted no more until restarted. | `vendor/peeroxide/SSHCRAB-PATCH.md` |
 
 Trade-offs of the P2P path compared with direct SCTP: control and data share one ordered stream (a lost packet
 delays both), and retransmissions follow libudx's timer (minimum 1 s) instead of ours (0.5 s). Measure with
@@ -292,22 +291,27 @@ nix build .#checks.x86_64-linux.p2p  # NixOS VM test: DHT node, NAT router, serv
 
 `nix/test-keys/alice` is a throwaway key for the VM test, public on purpose. Do not use it anywhere else.
 
-## 7. Changes to the peeroxide code
+## 7. peeroxide: no patches
 
-sshcrab builds two crates of the [peeroxide](https://crates.io/crates/peeroxide) project from patched copies in
-`vendor/`, used through `[patch.crates-io]` in `Cargo.toml`. Everything else of peeroxide (`peeroxide-dht`: the DHT,
-hole punching, Noise, SecretStream) is used unchanged from crates.io. Each copy is upstream 1.7.4 plus the changes
-below; the full diff is in `sshcrab.patch` next to it. Both are to be reported upstream, and a copy is dropped once
-upstream has an equivalent fix.
+sshcrab uses the crates of the [peeroxide](https://crates.io/crates/peeroxide) project (`peeroxide`, `peeroxide-dht`,
+`libudx`) unchanged from crates.io, pinned exactly to **1.8.1** in `p2p/Cargo.toml`. Up to 1.7.4 sshcrab carried
+patched copies of `libudx` and `peeroxide`; upstream fixed both problems in 1.8.0, and the copies were dropped. The
+tests that caught them stay, so an upgrade that brings a problem back fails them.
 
-| Crate | Upstream problem | Change | Test |
-|---|---|---|---|
-| `libudx` 1.7.4 ([details](vendor/libudx/SSHCRAB-PATCH.md)) | `UdxAsyncStream` allowed one unacknowledged write at a time, and `flush` waited for the ACK. SecretStream writes every message as header, body, flush, so each message cost two round trips: about 200 ms per keystroke at a 40 ms ping. | Writes return once queued (backpressure only above 1 MiB unacknowledged); `flush` no longer waits for ACKs; small writes are appended to the newest unsent packet; `shutdown` sends the FIN behind all data and waits until everything, FIN included, is acknowledged. | `p2p/tests/latency.rs` |
-| `peeroxide` 1.7.4 ([details](vendor/peeroxide/SSHCRAB-PATCH.md)) | A swarm counts connections against `max_peers` (64 in the helper) but gave a slot back only when setting up a connection failed, never when an established one ended. Every client uses a fresh key, so after 64 connections in total (reconnects included) `sshcrabd-p2p` ignored every new client until restarted; 64 throwaway keys did it on purpose. | Each `SwarmConnection` holds a slot guard that gives the slot back when the connection is dropped. Slots carry an id, so dropping an old connection never frees the slot of a newer one with the same key. | `p2p/tests/slots.rs` |
+| Problem in 1.7.4 | Fixed upstream in | Test |
+|---|---|---|
+| `libudx`: `UdxAsyncStream` allowed one unacknowledged write at a time and `flush` waited for the ACK. SecretStream writes every message as header, body, flush, so each message cost two round trips: about 200 ms per keystroke at a 40 ms ping. | 1.8.0: writes no longer wait for acknowledgements, `flush` returns at once, `shutdown` returns once the end of the stream is acknowledged (the write path now follows C libudx). | `p2p/tests/latency.rs` |
+| `peeroxide`: a swarm gave a connection's `max_peers` slot back only when setting it up failed. Every client uses a fresh key, so after 64 connections in total (reconnects included) `sshcrabd-p2p` ignored every new client until restarted; 64 throwaway keys did it on purpose. | 1.8.0 ([GHSA-48wj-x5q3-ggfq](https://github.com/Rightbracket/peeroxide/security/advisories/GHSA-48wj-x5q3-ggfq)) | `p2p/tests/slots.rs` |
 
-Not changed, but known (SPECIFICATION.md §13.8): a few denial-of-service issues in `peeroxide-dht` are open
-(unbounded allocations from a lookup reply and from SecretStream frame lengths before authentication).
+1.8.0 also fixed two other denial-of-service issues our review had noted: a lookup reply that could abort the client
+([GHSA-4jh8-33j3-h73j](https://github.com/Rightbracket/peeroxide/security/advisories/GHSA-4jh8-33j3-h73j)), and
+SecretStream allocating a frame's declared length (up to 16 MiB) before the peer is authenticated
+([GHSA-pchg-rmv6-56f4](https://github.com/Rightbracket/peeroxide/security/advisories/GHSA-pchg-rmv6-56f4)).
+
+Measured with `p2p/tests/latency.rs` (40 ms round trip): a keystroke's echo takes one round trip (43 ms); 50 small
+messages there and back take about two round trips on a fresh stream and one once its congestion window has grown
+(1.7.4: 4.4 s).
 
 ## License
 
-Public domain ([Unlicense](LICENSE)). The patched crates in `vendor/` keep their own license (MIT OR Apache-2.0).
+Public domain ([Unlicense](LICENSE)). Dependencies keep their own licenses.

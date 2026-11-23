@@ -1,7 +1,7 @@
 //! A server gives a connection's `max_peers` slot back once the connection is
-//! dropped (patched peeroxide, vendor/peeroxide/SSHCRAB-PATCH.md). Upstream
-//! kept it, so after `max_peers` connections in total, clients included, the
-//! helper accepted no more until it restarted.
+//! dropped. peeroxide up to 1.7.4 kept it (GHSA-48wj-x5q3-ggfq; fixed in 1.8.0),
+//! so after `max_peers` connections in total, clients included, the helper
+//! accepted no more until it restarted.
 
 use std::time::Duration;
 

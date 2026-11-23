@@ -91,9 +91,9 @@ async fn run() {
     let echo = start.elapsed() / rounds;
 
     // Burst: a screen redraw as many small messages, until the last echo is
-    // back. Upstream needed two round trips per message (about 4 s for 50);
-    // without coalescing, each message was two tiny UDX packets (SecretStream
-    // writes its 3-byte header separately) behind a 10-packet window (~4 RTT).
+    // back. libudx 1.7.4 needed two round trips per message (about 4 s for 50).
+    // From 1.8 a burst takes one round trip once the congestion window has
+    // grown, and about two before (BBR startup), so a fresh stream gets three.
     let n = 50;
     let mut bursts = vec![];
     for _ in 0..3 {
@@ -115,7 +115,7 @@ async fn run() {
     eprintln!("round trip {RTT:?}: echo {echo:?}; {n} messages there and back: {bursts:?}");
     assert!(echo < RTT * 3 / 2, "echo takes {echo:?}, over 1.5 round trips of {RTT:?}");
     for b in bursts {
-        assert!(b < RTT * 2, "{n} messages take {b:?}, over 2 round trips of {RTT:?}");
+        assert!(b < RTT * 3, "{n} messages take {b:?}, over 3 round trips of {RTT:?}");
     }
 }
 
