@@ -2,13 +2,12 @@
   description = "sshcrab: SSH-like remote shell over SCTP/UDP with resumable sessions";
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
-    cargo-libnix.url = "github:nixcloud/cargo";
     libfenix.url = "github:nixcloud/libfenix";
     libfenix.inputs.nixpkgs.follows = "nixpkgs";
     flake-utils.url = "github:numtide/flake-utils";
   };
   outputs =
-  { self, nixpkgs, flake-utils, libfenix, cargo-libnix }:
+  { self, nixpkgs, flake-utils, libfenix }:
     (flake-utils.lib.eachDefaultSystem
       (system:
         let
