@@ -32,6 +32,12 @@ The design and the security analysis are in [SPECIFICATION.md](SPECIFICATION.md)
 
 ![sshcrab](./sshcrab.jpg)
 
+### Video
+
+Why sshcrab is interesting and how it was developed:
+
+[![sshcrab on YouTube](https://img.youtube.com/vi/qdHQDtGOvbQ/hqdefault.jpg)](https://www.youtube.com/watch?v=qdHQDtGOvbQ)
+
 ## How it works
 
 ### Sessions outlive connections
