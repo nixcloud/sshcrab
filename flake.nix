@@ -76,8 +76,18 @@
         } // lib.optionalAttrs pkgs.stdenv.isLinux {
           # nix build .#checks.x86_64-linux.p2p (VM test: DHT nodes, server, client)
           checks.p2p = import ./nix/test-p2p.nix self { inherit pkgs; };
-          # Server behind NAT: hole punching. Not passing yet (SPECIFICATION.md §13.8).
+          # Server behind NAT: hole punching (SPECIFICATION.md §13.8).
           checks.p2p-nat = import ./nix/test-p2p.nix self { inherit pkgs; nat = true; };
+          # The same as systemd-nspawn containers: no KVM needed (nix/test-p2p.nix).
+          # They need the nixos-test and uid-range system features; on NixOS:
+          #   nix.settings = {
+          #     auto-allocate-uids = true;
+          #     extra-system-features = [ "uid-range" ];
+          #     experimental-features = [ "auto-allocate-uids" "cgroups" ];
+          #   };
+          # Without them nix refuses with "missing system features" (README.md).
+          checks.p2p-containers = import ./nix/test-p2p.nix self { inherit pkgs; containers = true; };
+          checks.p2p-nat-containers = import ./nix/test-p2p.nix self { inherit pkgs; nat = true; containers = true; };
         } // {
 
           devShells.default = pkgs.mkShell {

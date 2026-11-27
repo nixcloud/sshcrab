@@ -291,6 +291,18 @@ nix develop                          # rustc/cargo 1.99 (nixcloud cargo, nix bac
 cargo build && cargo test
 tests/e2e.sh && tests/e2e-p2p.sh     # end to end on 127.0.0.1
 nix build .#checks.x86_64-linux.p2p  # NixOS VM test: DHT node, NAT router, server, client
+nix build .#checks.x86_64-linux.p2p-containers  # the same in systemd-nspawn containers, no KVM
+```
+
+The `-containers` checks (`p2p-containers`, `p2p-nat-containers`) run the machines of the VM tests as
+systemd-nspawn containers: fast, and they work without KVM (WSL2, CI). The Nix daemon needs, on NixOS:
+
+```nix
+nix.settings = {
+  auto-allocate-uids = true;
+  extra-system-features = [ "uid-range" ];
+  experimental-features = [ "auto-allocate-uids" "cgroups" ];
+};
 ```
 
 `nix/test-keys/alice` is a throwaway key for the VM test, public on purpose. Do not use it anywhere else.

@@ -1,7 +1,9 @@
-# NixOS VM tests of the P2P stack (SPECIFICATION.md §13, P4).
-#
-# Both fail for now in the VMs, cause unknown (likely the VM environment): the same
-# stack passes on the host (tests/e2e-p2p.sh, p2p/tests/cross_host.rs). SPECIFICATION.md §13.8.
+# NixOS tests of the P2P stack (SPECIFICATION.md §13, P4), as QEMU VMs or as
+# systemd-nspawn containers. Both pass as containers (2026-11-27). They used to
+# fail: the test framework gives every machine 192.168.<vlan>.<node number>
+# besides the addresses set here, so the client's address was also the server's
+# and the server's hole punch went to itself; the addresses are now set with
+# mkForce. The VM variants have not been run since on a host with KVM.
 #
 # nat = false (checks.p2p): server, client and four DHT nodes on one network,
 #   no firewalls, so peeroxide connects directly (no hole punching);
@@ -18,13 +20,17 @@
 #                   │
 #     server ── lan (vlan 2)
 #
-#   Status: fails — signalling through the NAT works, the hole punch times out;
-#   it also fails without NAT when only the client has a firewall
-#   (SPECIFICATION.md §13.8).
+#   The router is a Linux masquerading NAT; client and router run firewalls.
+#
+# containers = true (checks.p2p-containers, checks.p2p-nat-containers): the same
+#   machines as systemd-nspawn containers instead of QEMU VMs: no KVM needed (WSL2,
+#   CI), seconds instead of minutes. They share the host kernel. The Nix daemon
+#   needs auto-allocate-uids, the uid-range system feature and the cgroups
+#   experimental feature (nixpkgs manual, "Running Tests"; README.md).
 #
 # nix/test-keys/alice is a throwaway key used nowhere else.
 self:
-{ pkgs, nat ? false, ... }:
+{ pkgs, nat ? false, containers ? false, ... }:
 let
   lib = pkgs.lib;
   dhtIp = "192.168.1.2";
@@ -33,16 +39,23 @@ let
   # The test driver gives every VM the same 10.0.2.15 on eth0 (QEMU user network).
   # peeroxide advertises local addresses and checks for a shared network, so
   # identical addresses on "different" hosts confuse it: no address on eth0.
-  common = { networking.useDHCP = lib.mkForce false; networking.interfaces.eth0.useDHCP = lib.mkForce false; };
+  # Containers have no eth0, only the vlan interfaces.
+  # The addresses below are set with mkForce: the test framework also gives every
+  # machine 192.168.<vlan>.<node number>, which made the client's address the
+  # server's too, so the server's hole punch went to itself.
+  common = lib.optionalAttrs (!containers) {
+    networking.useDHCP = lib.mkForce false;
+    networking.interfaces.eth0.useDHCP = lib.mkForce false;
+  };
 in
 pkgs.testers.runNixOSTest {
-  name = if nat then "sshcrab-p2p-nat" else "sshcrab-p2p";
+  name = (if nat then "sshcrab-p2p-nat" else "sshcrab-p2p") + lib.optionalString containers "-containers";
 
-  nodes = {
+  ${if containers then "containers" else "nodes"} = {
     dht = { ... }: {
       imports = [ self.nixosModules.default common ];
       virtualisation.vlans = [ 1 ];
-      networking.interfaces.eth1.ipv4.addresses = [{ address = dhtIp; prefixLength = 24; }];
+      networking.interfaces.eth1.ipv4.addresses = lib.mkForce [{ address = dhtIp; prefixLength = 24; }];
       services.sshcrab.dhtNode = { enable = true; public = false; host = dhtIp; };
       services.sshcrab.logLevel = "debug";
       # Three more nodes are started by the test script: NAT classification
@@ -53,7 +66,7 @@ pkgs.testers.runNixOSTest {
     server = { ... }: {
       imports = [ self.nixosModules.default common ];
       virtualisation.vlans = [ (if nat then 2 else 1) ];
-      networking.interfaces.eth1.ipv4.addresses = [{ address = serverIp; prefixLength = 24; }];
+      networking.interfaces.eth1.ipv4.addresses = lib.mkForce [{ address = serverIp; prefixLength = 24; }];
       networking.defaultGateway = lib.mkIf nat { address = "10.0.0.1"; interface = "eth1"; };
       # Without NAT the server is directly dialable (firewall off); behind the NAT
       # nothing is opened. The sshcrabd UDP port is never used by the test.
@@ -71,9 +84,9 @@ pkgs.testers.runNixOSTest {
     client = { ... }: {
       imports = [ common ];
       virtualisation.vlans = [ 1 ];
-      networking.interfaces.eth1.ipv4.addresses = [{ address = "192.168.1.3"; prefixLength = 24; }];
-      # peeroxide hole punching fails as soon as one side drops unsolicited UDP
-      # (SPECIFICATION.md §13.8), so only the NAT variant runs a client firewall.
+      networking.interfaces.eth1.ipv4.addresses = lib.mkForce [{ address = "192.168.1.3"; prefixLength = 24; }];
+      # A firewall only in the NAT variant: without NAT the test covers the
+      # direct path, with it the hole punch through both.
       networking.firewall.enable = nat;
       environment.systemPackages = [ self.packages.${pkgs.stdenv.hostPlatform.system}.sshcrab ];
     };
@@ -81,8 +94,8 @@ pkgs.testers.runNixOSTest {
     router = { ... }: {
       imports = [ common ];
       virtualisation.vlans = [ 1 2 ];
-      networking.interfaces.eth1.ipv4.addresses = [{ address = "192.168.1.1"; prefixLength = 24; }];
-      networking.interfaces.eth2.ipv4.addresses = [{ address = "10.0.0.1"; prefixLength = 24; }];
+      networking.interfaces.eth1.ipv4.addresses = lib.mkForce [{ address = "192.168.1.1"; prefixLength = 24; }];
+      networking.interfaces.eth2.ipv4.addresses = lib.mkForce [{ address = "10.0.0.1"; prefixLength = 24; }];
       networking.nat = { enable = true; externalInterface = "eth1"; internalInterfaces = [ "eth2" ]; };
       networking.firewall.enable = true;
       environment.systemPackages = [ pkgs.tcpdump pkgs.conntrack-tools ];
@@ -112,7 +125,7 @@ pkgs.testers.runNixOSTest {
   '' + lib.optionalString nat ''
 
     with subtest("the server cannot be reached directly"):
-        client.fail("ping -c 1 -W 2 ${serverIp}")
+        client.fail("${pkgs.iputils}/bin/ping -c 1 -W 2 ${serverIp}")
   '' + ''
 
     client.succeed("mkdir -m 700 -p /root/.sshcrab")
@@ -124,12 +137,15 @@ pkgs.testers.runNixOSTest {
         # Retried: right after the announce the DHT may not have settled yet.
         server.succeed("systemd-run --unit=capture tcpdump -lni any -c 300 -w /tmp/cap.pcap 'udp and not port 49737 and not port 49738 and not port 49739 and not port 49740'")
         try:
-            client.wait_until_succeeds(f"RUST_LOG=debug {ssh} true 2>/tmp/client.log; grep -q 'use --accept-new' /tmp/client.log", timeout=100)
+            # stdin not a terminal: the client would ask instead of refusing. The
+            # driver runs commands with `set -e`, and the refusal exits 1: `|| true`.
+            client.wait_until_succeeds(f"RUST_LOG=debug {ssh} true </dev/null 2>/tmp/client.log || true; grep -q 'use --accept-new' /tmp/client.log", timeout=100)
         except Exception:
+            print(client.execute("grep -vE 'DEBUG|TRACE' /tmp/client.log | cut -c1-240 | tail -20")[1])
+            print(client.execute("grep -E 'deciding|direct-connect|stream connected|socket|bound|local' /tmp/client.log | cut -c1-240 | tail -20")[1])
             server.execute("systemctl stop capture; sleep 1")
-            print(server.succeed("tcpdump -nr /tmp/cap.pcap 2>&1 | head -60"))
-            print(server.succeed("ss -uanp | grep sshcrabd-p2p"))
-            print(client.succeed("grep -E 'deciding|direct-connect|stream connected|socket|bound|local' /tmp/client.log | cut -c1-240 | tail -20"))
+            print(server.execute("tcpdump -nr /tmp/cap.pcap 2>&1 | head -60")[1])
+            print(server.execute("ss -uanp | grep sshcrabd-p2p")[1])
             raise
 
     with subtest("a command runs as alice, key from AuthorizedKeysDir"):

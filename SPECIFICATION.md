@@ -551,7 +551,7 @@ snow), `sha2`, `subtle`, `zeroize`, `postcard`, `serde`, `ruzstd`, `nix`, `clap`
 | M7 daemon ops | mostly — config, `-p`, host key checks, NixOS module; module not yet tested in a VM |
 | M8 tests | partial — 18 unit tests + `tests/e2e.sh` (16 checks incl. a 20 s outage); NixOS VM test missing |
 | M9 privilege separation | not started — release blocker |
-| P2P backend (§13) | implemented; hole punching works between distinct addresses on one host (16/16 e2e); real NAT not yet verified (§13.8) |
+| P2P backend (§13) | implemented; hole punching works between distinct addresses on one host (e2e) and through a Linux NAT router (`checks.p2p-nat-containers`); real-internet NATs not yet verified (§13.8) |
 
 Known gaps: never run as root yet (setuid path, PTY chown, `/proc/self/loginuid`, `setfsuid`); output throughput
 is ~2.5 MB/s on loopback in a debug build (one ack per 16 KiB chunk, compression of incompressible data); no
@@ -645,10 +645,12 @@ sshcrab ──DHT lookup + hole punch──► sshcrabd-p2p (sandboxed, user ssh
 - Tests: `p2p/tests/local_dht.rs` (bootstrap node, announce, connect, relay, handshake on 127.0.0.1),
   `tests/e2e-p2p.sh` (16 checks, three simulated hosts: address, TOFU, commands, 2 MB both ways, PTY, hole-punch path, helper restart, mismatch,
   sshcrabd not linking peeroxide), handshake over a bridged pipe, address and fd-passing unit tests.
-- NixOS VM tests (`nix/test-p2p.nix`, KVM through the Nix daemon): `checks.p2p` runs the sandboxed module stack
+- NixOS tests (`nix/test-p2p.nix`): `checks.p2p` runs the sandboxed module stack
   (root sshcrabd, `sshcrab-p2p` user, `AuthorizedKeysDir`, announce retry, data both ways, helper restart) between
-  hosts without firewalls. `checks.p2p-nat` puts the server behind a NAT router.
-- **Hole punching: works in the host tests, not yet verified across real NATs.** Findings:
+  hosts without firewalls. `checks.p2p-nat` puts the server behind a NAT router. Both as QEMU VMs (KVM) or as
+  systemd-nspawn containers (`checks.p2p-containers`, `checks.p2p-nat-containers`, no KVM, about 2 minutes each).
+- **Hole punching: works in the host tests and through a Linux NAT router (container tests, 2026-11-27); not yet
+  verified across real-internet NATs.** Findings:
   1. Signalling works through the NAT: the client finds the record, and PEER_HANDSHAKE is relayed via a DHT node in
      both directions.
   2. A server announcing before any DHT node is reachable "succeeds" and is only retried after 10 minutes; fixed:
@@ -657,10 +659,12 @@ sshcrab ──DHT lookup + hole punch──► sshcrabd-p2p (sandboxed, user ssh
      address); fixed: refused by `sshcrab-dht-node` and asserted in the module (§13.6).
   4. NAT classification needs replies from at least three DHT nodes; with fewer the server reports `UNKNOWN` and
      never offers hole punching (on the internet there are enough nodes).
-  5. In the VMs both sides then run peeroxide's hole punch and time out; also without NAT and without firewalls.
-     The VMs had a second interface with the same address (10.0.2.15) on every host, which peeroxide advertises
-     and probes; removing it did not fix the VM test either. **Cause not found; most likely the VM environment
-     or our configuration there, not peeroxide** — see 6.
+  5. In the VMs both sides then ran peeroxide's hole punch and timed out; also without NAT and without firewalls.
+     **Cause (found 2026-11-27): our test configuration, not peeroxide.** The test framework gives every machine
+     `192.168.<vlan>.<node number>` besides the addresses the test sets, so the client's 192.168.1.3 was also the
+     server's, and the server's punch went to itself. With only the test's addresses (`mkForce`) both tests pass,
+     NAT included. A second fault showed up behind it: the test driver runs commands with `set -e`, so the first
+     check's `sshcrab …; grep` stopped at the expected refusal (exit 1).
   6. **Host test (`p2p/tests/cross_host.rs`, `tests/e2e-p2p.sh`): it works.** One machine plays three hosts
      (DHT nodes on 127.0.0.1, server on 127.0.0.2, client on 127.0.0.3, peeroxide's same-network shortcut off via
      `SSHCRAB_P2P_BIND`/`SSHCRAB_P2P_NO_LOCAL`). Signalling, NAT classification, hole punch ("passive holepunch
@@ -673,8 +677,7 @@ sshcrab ──DHT lookup + hole punch──► sshcrabd-p2p (sandboxed, user ssh
      acknowledgements (README.md section 7). `p2p/tests/latency.rs` (40 ms simulated round trip): echo 132 ms
      (1.7.4) → 43 ms (1.8.1); 50 messages there and back 4.4 s → about two round trips on a fresh stream, one
      once its congestion window has grown.
-  Open: real NATs and firewalls are only covered by the VM tests, which still fail; the test environment comes first
-  (SPECIFICATION.md §11, test plan).
+  Open: NATs other than Linux masquerading (home routers, symmetric NATs, which need the relay) are untested.
 - **Connection slots (fixed in peeroxide 1.8.0, GHSA-48wj-x5q3-ggfq):** 1.7.4 gave a connection's `max_peers` slot
   back only when setting it up failed, so after 64 connections in total (every client uses a fresh key) the
   helper accepted none until it restarted. Test `p2p/tests/slots.rs`.
