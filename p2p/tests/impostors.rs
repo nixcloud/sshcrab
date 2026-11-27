@@ -2,19 +2,15 @@
 //! server's key itself (`join_peer`), so it must reach the real server however
 //! many others announce under the server's key (`hash(key)`, also its topic).
 //!
-//! Ignored: peeroxide-dht 1.8.1 does not hold. A DHT node that accepts an
-//! ANNOUNCE sets its handshake forwarding for that target to the announcer,
-//! whoever announced (`hyperdht.rs`, the ANNOUNCE arm of the request handler),
-//! so one announcer under `hash(key)` takes the handshakes meant for the
-//! server and the client never connects (SPECIFICATION.md §13.8). Run with
-//! `cargo test -p sshcrab-p2p --test impostors -- --ignored`.
+//! Held since peeroxide-dht 1.8.2: before, a DHT node pointed its handshake
+//! forwarding for a target at whoever announced under it, so one announcer
+//! under `hash(key)` took the server's handshakes (SPECIFICATION.md §13.8).
 
 use std::time::Duration;
 
 use peeroxide_dht::hyperdht::KeyPair;
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "peeroxide-dht forwards handshakes to whoever announced last (SPECIFICATION.md §13.8)"]
 async fn announcers_under_the_key_do_not_keep_clients_away() {
     let _ = env_logger::builder().is_test(true).try_init();
     let (boot, _t1) = sshcrab_p2p::run_node("127.0.0.1", 0, &[]).await.unwrap();

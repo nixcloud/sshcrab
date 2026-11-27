@@ -881,9 +881,9 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libudx"
-version = "1.8.1"
+version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fcafc5d6da91e11e0176d17adc8303d15a22f752cb518be5ea142664405b4a1"
+checksum = "4921e98edcda3ef4c0ab70af10e18c20fce9bed89def9aaf2c0414778e4a1769"
 dependencies = [
  "rustix",
  "socket2",
@@ -1084,9 +1084,9 @@ dependencies = [
 
 [[package]]
 name = "peeroxide"
-version = "1.8.1"
+version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f2c01d199f8640ac118f9212b1d8334176b59d4fe749854aa533422cbcc1304"
+checksum = "b02f5ca4e1f93fa3e03405150e243459c3be5551db65ab84ada88205471cf2d0"
 dependencies = [
  "libudx",
  "peeroxide-dht",
@@ -1098,9 +1098,9 @@ dependencies = [
 
 [[package]]
 name = "peeroxide-dht"
-version = "1.8.1"
+version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "198f198fafc70710bcc5453c54313363c083c6d3931800500e688407c10f45e7"
+checksum = "4a46aa99f991a26c17c2a56d94768e85fbe040c491dcf25145e41b0870121199"
 dependencies = [
  "blake2",
  "chacha20",

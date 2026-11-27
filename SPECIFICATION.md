@@ -560,7 +560,7 @@ fuzzing; no `cargo deny`/`cargo audit` in CI.
 ## 13. P2P backend (hosts behind NAT) **[decision]**
 
 Background and requirements: `P2P.md` (registry, hole punching, threat analysis). This section is what sshcrab
-implements and where it deviates. Built on **peeroxide 1.8.1** (Rust HyperDHT), unpatched and pinned exactly.
+implements and where it deviates. Built on **peeroxide 1.8.3** (Rust HyperDHT), unpatched and pinned exactly.
 
 ```
 sshcrab ──DHT lookup + hole punch──► sshcrabd-p2p (sandboxed, user sshcrab-p2p) ──socketpair fd──► sshcrabd (root)
@@ -681,13 +681,13 @@ sshcrab ──DHT lookup + hole punch──► sshcrabd-p2p (sandboxed, user ssh
 - **Denial of service, from a review (2026-11-11):** fixed in peeroxide 1.8.0: a lookup reply with a huge count
   aborted the client (GHSA-4jh8-33j3-h73j), SecretStream allocated a frame of up to 16 MiB before authenticating
   it (GHSA-pchg-rmv6-56f4).
-- **Open, in peeroxide-dht 1.8.1: anyone can make a P2P server unreachable.** A DHT node that accepts an ANNOUNCE
-  sets its handshake forwarding for that target to the announcer's address, whoever announced (`hyperdht.rs`, the
-  ANNOUNCE arm of the request handler; its storage, `persistent.rs`, does check `hash(announcer) == target`). So
-  one swarm announcing with a key of its own under `hash(server key)` (also the server's topic:
-  `peeroxide::discovery_key` is `hash`) takes the handshakes meant for the server, and clients never connect.
-  Shown by `p2p/tests/impostors.rs` (ignored until fixed) with a single impostor, with the client dialling the
-  key through `join_peer` (since 2026-11-22) as well as through the topic before. To report upstream.
+- **Anyone could make a P2P server unreachable**, fixed in peeroxide-dht 1.8.2 (reported by us, upstream #69). A
+  DHT node that accepted an ANNOUNCE set its handshake forwarding for that target to the announcer's address,
+  whoever announced. So one swarm announcing with a key of its own under `hash(server key)` (also the server's
+  topic: `peeroxide::discovery_key` is `hash`) took the handshakes meant for the server, and clients never
+  connected, whether they dialled the key through `join_peer` or found it through the topic. Likewise another
+  key's UNANNOUNCE removed the server's record. Since 1.8.2 only `hash(announcer) == target` sets or clears the
+  forwarding, as in Node's HyperDHT. Test `p2p/tests/impostors.rs`.
 - Not yet: the relay for symmetric NATs, IPv6, a fuzz target for the frame decoder.
 - A client that refuses the host key exits before its bridge has closed the peeroxide stream; sshcrabd notices only
   at the 10 s handshake timeout (one pre-auth slot meanwhile), as with any client that vanishes.

@@ -133,8 +133,9 @@ pub async fn connect(bootstrap: &[String], remote: [u8; 32], progress: impl Fn(S
     log::debug!("joined the DHT in {:?}", start.elapsed());
     progress(Stage::FindingServer);
     // Dial the server's key itself rather than every peer announced on its
-    // topic (anyone may announce there). It does not yet protect against
-    // announcers under that target: see tests/impostors.rs.
+    // topic (anyone may announce there). Announcers under that target with
+    // other keys get no handshakes since peeroxide-dht 1.8.2: see
+    // tests/impostors.rs.
     swarm.handle.join_peer(remote).await?;
     // Only the holder of `remote` counts (Noise IK authenticated the key the
     // swarm reports); nothing else should arrive, as we announce nothing.

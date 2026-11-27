@@ -23,9 +23,7 @@ The design and the security analysis are in [SPECIFICATION.md](SPECIFICATION.md)
 >   into a root monitor and a sandboxed network worker is not done (SPECIFICATION.md §7.4). Also fuzzing, a
 >   constant-time login path (user names can be told apart by timing) and an external review of the handshake.
 > - **P2P:** peeroxide (DHT, hole punching, its encryption) is young and unaudited; several denial-of-service
->   issues were fixed upstream only in 1.8.0 (section 7), and one is open: **anyone can make a P2P server
->   unreachable** by announcing under its key in the DHT (SPECIFICATION.md §13.8). There is no relay for
->   symmetric NATs.
+>   issues were fixed upstream only in 1.8.0 and 1.8.2 (section 7). There is no relay for symmetric NATs.
 >
 > Our own encryption layer (Noise + Ed25519, the same on both paths) is the part reviewed most so far. Use sshcrab
 > next to OpenSSH, never as the only way into a machine.
@@ -300,7 +298,7 @@ nix build .#checks.x86_64-linux.p2p  # NixOS VM test: DHT node, NAT router, serv
 ## 7. peeroxide: no patches
 
 sshcrab uses the crates of the [peeroxide](https://crates.io/crates/peeroxide) project (`peeroxide`, `peeroxide-dht`,
-`libudx`) unchanged from crates.io, pinned exactly to **1.8.1** in `p2p/Cargo.toml`. Up to 1.7.4 sshcrab carried
+`libudx`) unchanged from crates.io, pinned exactly to **1.8.3** in `p2p/Cargo.toml`. Up to 1.7.4 sshcrab carried
 patched copies of `libudx` and `peeroxide`; upstream fixed both problems in 1.8.0, and the copies were dropped. The
 tests that caught them stay, so an upgrade that brings a problem back fails them.
 
@@ -313,6 +311,10 @@ tests that caught them stay, so an upgrade that brings a problem back fails them
 ([GHSA-4jh8-33j3-h73j](https://github.com/Rightbracket/peeroxide/security/advisories/GHSA-4jh8-33j3-h73j)), and
 SecretStream allocating a frame's declared length (up to 16 MiB) before the peer is authenticated
 ([GHSA-pchg-rmv6-56f4](https://github.com/Rightbracket/peeroxide/security/advisories/GHSA-pchg-rmv6-56f4)).
+
+1.8.2 fixed one we reported: anyone could make a P2P server unreachable by announcing under its key with a key of
+their own, as DHT nodes forwarded the server's handshakes to whoever announced last (upstream #69, SPECIFICATION.md
+§13.8). Test `p2p/tests/impostors.rs`.
 
 Measured with `p2p/tests/latency.rs` (40 ms round trip): a keystroke's echo takes one round trip (43 ms); 50 small
 messages there and back take about two round trips on a fresh stream and one once its congestion window has grown
