@@ -17,7 +17,7 @@
           lib = pkgs.lib;
 
           lf = import libfenix { inherit system pkgs; };
-          # rustc 1.99.0 + cargo (libnix) 1.99.0+v3 + the host std
+          # rustc 1.99.0 + cargo (libnix) 1.99.0+v4 + the host std
           rust_toolchain = lf.rust-1_99.minimalToolchain;
 
           src = builtins.filterSource

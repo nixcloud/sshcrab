@@ -506,7 +506,7 @@ snow), `sha2`, `subtle`, `zeroize`, `postcard`, `serde`, `ruzstd`, `nix`, `clap`
 
 ## 10. Build & toolchain
 
-- Toolchain: `nixcloud/cargo` (libnix) 1.99.0+v3 with rustc 1.99.0, both provided by the flake through `libfenix`
+- Toolchain: `nixcloud/cargo` (libnix) 1.99.0+v4 with rustc 1.99.0, both provided by the flake through `libfenix`
   (`lf.rust-1_99.minimalToolchain`). No rustup; no other toolchain.
 - Development happens inside `nix develop`, which provides the toolchain and sets `CARGO_BACKEND=nix`; plain
   `cargo build` / `cargo test` work there.

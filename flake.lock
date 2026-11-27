@@ -25,11 +25,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1794014162,
-        "narHash": "sha256-dLIJakrGOwnLcsgFWMbUkBwdNt7ZU8FcSJeRS7cjOvE=",
+        "lastModified": 1795561658,
+        "narHash": "sha256-Ecns2/3xguR76KiFDBilpTzhMe/iwbZe3cY/6/HCrnw=",
         "owner": "nixcloud",
         "repo": "libfenix",
-        "rev": "06ef9ecc7862a6b67fb509c6f1a306effe6507e0",
+        "rev": "e257750f9069bf3dd83ff591d55fdc6e706676ab",
         "type": "github"
       },
       "original": {
